@@ -1,5 +1,5 @@
-// One runnable check on the shared diff/queue logic. ponytail: smallest thing
-// that fails if the diff math, backoff schedule or escaping breaks.
+// One runnable check on the shared diff/queue logic — the smallest thing that
+// fails if the diff math, backoff schedule or escaping breaks.
 import { byId, esc } from './core/utils.js';
 
 export const selfTest = () => {

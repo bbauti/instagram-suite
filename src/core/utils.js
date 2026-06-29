@@ -18,7 +18,7 @@ export const fmtDelta = (n) => {
 };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// crypto RNG (jitter only) — equivalent to Math.random, keeps SonarLint S2245 clean
+// crypto RNG (jitter only) — equivalent to Math.random here
 export const randInt = (a, b) => a + Math.floor(crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32 * (b - a + 1));
 export const uid = (() => { let n = 0; return () => `a${Date.now().toString(36)}${n++}`; })();
 

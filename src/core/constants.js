@@ -2,7 +2,7 @@
 export const HOST = 'www.instagram.com';
 export const IG_APP_ID = '936619743392459';
 export const PAGE_SIZE = 48;
-export const ROW_CAP = 600; // ponytail: cap rendered rows; search still filters the full set
+export const ROW_CAP = 600; // cap rendered rows; search still filters the full set
 
 // GraphQL query hashes (InstagramUnfollowers / followaccount set)
 export const HASH = {

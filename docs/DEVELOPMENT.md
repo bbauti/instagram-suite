@@ -252,16 +252,16 @@ Existing registered kinds, for reference: `unfollow` (Ledger), `fm-follow` / `fm
 
 Match the existing style — **do not propose rewrites**:
 
-- **Lean / "ponytail" style.** Smallest thing that works. Prefer one expression over five
+- **Lean style.** Smallest thing that works. Prefer one expression over five
   lines, the standard library over a helper, a native browser feature over a dependency. The
   in-browser ZIP reader uses `DecompressionStream`; there is no third-party library at
   runtime, and we keep it that way.
 - **Modern ES only.** Arrow functions, `const`/`let`, template literals, `async/await`,
   optional chaining (`?.`), `structuredClone`, `replaceAll`, `dataset`,
   `crypto.getRandomValues`. The build target is current Chrome, so use it.
-- **SonarLint/SonarJS-clean.** No dead code, no needless complexity, no duplicated blocks.
+- **Tidy.** No dead code, no needless complexity, no duplicated blocks.
 - **Lightly commented.** A short header comment per file explaining its job; sparse inline
-  notes only where intent isn't obvious. Deliberate shortcuts are tagged `ponytail:`.
+  notes only where intent isn't obvious.
 - **Documentation lives in `docs/`,** not as comment walls in the source. If something needs
   a paragraph of explanation, it belongs here or in another `docs/` file.
 - **localStorage keys are `igs-`-prefixed** and go through [`store`](../src/core/store.js)

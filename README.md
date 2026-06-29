@@ -106,8 +106,8 @@ Import your official **Instagram data export** and clean up follow requests you
 ## For developers
 
 The pasteable file in `dist/` is **generated** from modular sources under `src/`.
-The codebase is deliberately lean and lightly commented, written in modern ES, and
-kept SonarLint/SonarJS-clean. Documentation lives in `docs/`, not in comment walls.
+The codebase is deliberately lean and lightly commented, written in modern ES.
+Documentation lives in `docs/`, not in comment walls.
 
 ### Source layout
 

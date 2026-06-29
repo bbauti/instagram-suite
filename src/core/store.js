@@ -1,5 +1,5 @@
 // localStorage layer. Degrades to compact records on quota.
-// ponytail: ~5MB ceiling. Move to IndexedDB only if a very large account overflows.
+// ~5MB ceiling. Move to IndexedDB only if a very large account overflows.
 export const store = {
   get(key, dflt) {
     try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : dflt; }
