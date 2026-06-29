@@ -101,7 +101,7 @@ do not reintroduce one by importing the shell from a tool for state.
 
 - Modern ES: arrows, `const`/`let`, template literals, `async`/`await`, optional chaining,
   `structuredClone`, `replaceAll`, `dataset`, `crypto.getRandomValues`.
-- "Ponytail" style: lean, minimal, simple, lightly commented. Keep it SonarLint/SonarJS-clean.
+- Lean and minimal: the smallest thing that works, lightly commented. Keep it SonarLint/SonarJS-clean.
 - Documentation lives in `docs/`, NOT as comment walls in the code.
 - Rendering: full `render()` on structural change; partial re-renders
   (`refreshListBody`/`renderCards`/`refreshRows`) for search/filter/queue updates to preserve

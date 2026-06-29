@@ -187,7 +187,6 @@ root:
 │   ├── selftest.js          self-check (__igsSelfTest)
 │   └── main.js              entry point
 ├── docs/                    architecture, development, tools, api docs
-├── legacy/                  archived pre-refactor scripts (reference only)
 ├── README.md                this file
 ├── AGENTS.md                guide for AI coding agents
 ├── LICENSE                  MIT
