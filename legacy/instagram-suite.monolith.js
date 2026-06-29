@@ -1,0 +1,1634 @@
+/* ============================================================================
+ *  Instagram Suite — one console SPA, three tools, one design system
+ * ----------------------------------------------------------------------------
+ *  Paste this whole file into the Chrome DevTools console on instagram.com
+ *  (logged in). A full-screen overlay opens with three tools sharing one core:
+ *
+ *    • Ledger     — scan YOUR followers/following, diff over time, dashboard,
+ *                   growth chart, activity feed, paced unfollow.
+ *    • Followers  — load the followers of any profile you open, enrich cards
+ *                   (posts/highlights/mutuals), follow/unfollow.
+ *    • Pending    — import your Instagram data export, list every follow
+ *                   request you SENT that's still pending, verify/cancel them.
+ *
+ *  Merged from three standalone scripts (instagramremovedfollows /
+ *  instagramfollowaccount / instagrampendingreqs). They now share ONE api
+ *  client, ONE paced action queue (single cooldown + rate-limit pause across
+ *  every tool), ONE localStorage layer and ONE Müller-Brockmann design system
+ *  (white paper, near-black ink, one Swiss-red accent, mono labels, big
+ *  numerals). Modern ES, SonarLint-clean.
+ *
+ *  Nothing leaves your browser. All data lives in localStorage on this device.
+ * ========================================================================== */
+
+(() => {
+  'use strict';
+
+  // teardown a previous instance
+  document.getElementById('igs-root')?.remove();
+  document.getElementById('igs-style')?.remove();
+
+  // ==========================================================================
+  // Shared constants
+  // ==========================================================================
+  const HOST = 'www.instagram.com';
+  const IG_APP_ID = '936619743392459';
+  const PAGE_SIZE = 48;
+  const ROW_CAP = 600; // ponytail: cap rendered rows; search still filters the full set
+
+  // GraphQL query hashes (InstagramUnfollowers / followaccount set)
+  const HASH = {
+    followers: 'c76146de99bb02f6415203be841dd25a', // edge_followed_by
+    following: '3dec7e2c57367ef3da3d987d89f9dbc8', // edge_follow
+    highlights: 'd4d88dc1500312af6f937f7b804c68c3', // edge_highlight_reels
+  };
+  const EDGE = { followers: 'edge_followed_by', following: 'edge_follow' };
+
+  const RATE_LIMIT_RE = [
+    /try again later/i, /wait a few minutes/i, /feedback[_ ]required/i,
+    /checkpoint[_ ]required/i, /action blocked/i, /rate[_ ]?limit/i, /\bspam\b/i,
+  ];
+
+  // ==========================================================================
+  // Utils
+  // ==========================================================================
+  const $ = (sel, scope) => (scope || document).querySelector(sel);
+  const $$ = (sel, scope) => [...(scope || document).querySelectorAll(sel)];
+  const getCookie = (name) => {
+    const parts = `; ${document.cookie}`.split(`; ${name}=`);
+    return parts.length === 2 ? parts.pop().split(';').shift() : null;
+  };
+  const esc = (s) => String(s ?? '')
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+  const fmt = (n) => Number.isFinite(n) ? n.toLocaleString('en-US') : '—';
+  const fmtDelta = (n) => {
+    if (!Number.isFinite(n)) return '—';
+    return `${n > 0 ? '+' : ''}${fmt(n)}`;
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // crypto RNG (jitter only) — equivalent to Math.random, keeps SonarLint S2245 clean
+  const randInt = (a, b) => a + Math.floor(crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32 * (b - a + 1));
+  const uid = (() => { let n = 0; return () => `a${Date.now().toString(36)}${n++}`; })();
+  const fmtAgo = (ts) => {
+    if (!ts) return 'never';
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24); if (d < 30) return `${d}d ago`;
+    return new Date(ts).toLocaleDateString();
+  };
+  const fmtDate = (ts) => { try { return new Date(ts).toLocaleString(); } catch { return '—'; } };
+  const fmtCountdown = (ms) => {
+    if (ms <= 0) return 'now';
+    const s = Math.ceil(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m ${s % 60}s`;
+  };
+  const byId = (list) => Object.fromEntries((list || []).map((u) => [u.id, u]));
+
+  // ==========================================================================
+  // Storage (localStorage; degrades to compact records on quota — ponytail:
+  // ~5MB ceiling. Move to IndexedDB only if a very large account overflows.)
+  // ==========================================================================
+  const store = {
+    get(key, dflt) {
+      try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : dflt; }
+      catch { return dflt; }
+    },
+    setRaw(key, obj) { localStorage.setItem(key, JSON.stringify(obj)); },
+    save(key, obj) {
+      try { this.setRaw(key, obj); return true; }
+      catch {
+        try {
+          const compact = structuredClone(obj);
+          for (const k of ['followers', 'following', 'users']) {
+            if (Array.isArray(compact[k])) {
+              compact[k] = compact[k].map((u) => ({ id: u.id, username: u.username, isVerified: u.isVerified, isPrivate: u.isPrivate }));
+            }
+          }
+          compact._compact = true;
+          this.setRaw(key, compact);
+          return true;
+        } catch { return false; }
+      }
+    },
+    remove(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } },
+  };
+
+  // ==========================================================================
+  // Instagram API — one client for all three tools
+  // ==========================================================================
+  class RateLimit extends Error {
+    constructor(detail) { super('Instagram rate limit / action block'); this.name = 'RateLimit'; this.detail = detail; }
+  }
+  class ApiError extends Error {
+    constructor(message, status) { super(message); this.name = 'ApiError'; this.status = status; }
+  }
+
+  const api = {
+    get viewerId() { return getCookie('ds_user_id'); },
+    get csrf() { return getCookie('csrftoken'); },
+    get loggedIn() { return !!this.viewerId && location.hostname === HOST; },
+    appHeaders() { return { 'x-ig-app-id': IG_APP_ID, 'x-requested-with': 'XMLHttpRequest' }; },
+
+    async _fetch(url, opts) {
+      let res;
+      try { res = await fetch(url, opts); }
+      catch (e) { throw new ApiError(`Network failure: ${e?.message}`, 0); }
+      const body = await res.json().catch(() => null);
+      const text = body ? JSON.stringify(body) : '';
+      const flagged = res.status === 429 ||
+        body?.feedback_required || body?.spam || body?.checkpoint_url ||
+        RATE_LIMIT_RE.some((re) => re.test(text));
+      if (flagged) throw new RateLimit(body?.feedback_message || body?.message || `HTTP ${res.status}`);
+      if (!res.ok) throw new ApiError(body?.message || `HTTP ${res.status}`, res.status);
+      return body;
+    },
+    request(url) { return this._fetch(url, { credentials: 'include', mode: 'cors', headers: this.appHeaders() }); },
+    async friendshipPost(primary, fallback) {
+      if (!this.csrf) throw new ApiError('No csrftoken cookie — are you logged in?', 401);
+      const opts = {
+        method: 'POST', credentials: 'include', mode: 'cors',
+        headers: { ...this.appHeaders(), 'content-type': 'application/x-www-form-urlencoded', 'x-csrftoken': this.csrf },
+      };
+      try { return await this._fetch(primary, opts); }
+      catch (err) { if (err instanceof RateLimit) { throw err; } return this._fetch(fallback, opts); }
+    },
+    follow(userId) {
+      return this.friendshipPost(`https://${HOST}/api/v1/friendships/create/${userId}/`, `https://${HOST}/web/friendships/${userId}/follow/`);
+    },
+    unfollow(userId) {
+      return this.friendshipPost(`https://${HOST}/api/v1/friendships/destroy/${userId}/`, `https://${HOST}/web/friendships/${userId}/unfollow/`);
+    },
+
+    // Profile info + last 3 posts (web_profile_info)
+    async getWebProfile(username) {
+      const body = await this.request(`https://${HOST}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`);
+      const u = body?.data?.user;
+      if (!u) throw new ApiError(`Profile "${username}" not found`, 404);
+      const media = u.edge_owner_to_timeline_media?.edges || [];
+      return {
+        id: String(u.id), username: u.username, fullName: u.full_name || '',
+        picUrl: u.profile_pic_url || '', picUrlHd: u.profile_pic_url_hd || u.profile_pic_url || '',
+        isPrivate: !!u.is_private, isVerified: !!u.is_verified,
+        followerCount: u.edge_followed_by?.count ?? 0, followingCount: u.edge_follow?.count ?? 0,
+        mutualCount: u.edge_mutual_followed_by?.count ?? 0, postsCount: u.edge_owner_to_timeline_media?.count ?? 0,
+        followedByViewer: u.followed_by_viewer ?? null, requestedByViewer: u.requested_by_viewer ?? null,
+        posts: media.slice(0, 3).map((e) => ({ thumb: e.node.thumbnail_src || e.node.display_url || '', shortcode: e.node.shortcode || '' })),
+      };
+    },
+    // Friendship status fallback (friendships/show)
+    async getFriendship(userId) {
+      const body = await this.request(`https://${HOST}/api/v1/friendships/show/${userId}/`);
+      return { outgoingRequest: !!body?.outgoing_request, following: !!body?.following };
+    },
+
+    _mapGraph(n) {
+      return {
+        id: String(n.id), username: n.username, fullName: n.full_name || '', picUrl: n.profile_pic_url || '',
+        isPrivate: !!n.is_private, isVerified: !!n.is_verified,
+        followedByViewer: n.followed_by_viewer ?? null, requestedByViewer: n.requested_by_viewer ?? null, followsViewer: n.follows_viewer ?? null,
+      };
+    },
+    _mapApi(u) {
+      return {
+        id: String(u.pk ?? u.pk_id), username: u.username, fullName: u.full_name || '', picUrl: u.profile_pic_url || '',
+        isPrivate: !!u.is_private, isVerified: !!u.is_verified, followedByViewer: null, requestedByViewer: null, followsViewer: null,
+      };
+    },
+    // One page of followers|following for any user id. GraphQL first, api/v1 fallback.
+    async page(kind, after, userId) {
+      const id = userId || this.viewerId;
+      const vars = { id, include_reel: false, fetch_mutual: false, first: PAGE_SIZE };
+      if (after) vars.after = after;
+      const url = `https://${HOST}/graphql/query/?query_hash=${HASH[kind]}&variables=${encodeURIComponent(JSON.stringify(vars))}`;
+      try {
+        const body = await this.request(url);
+        const edge = body?.data?.user?.[EDGE[kind]];
+        if (!edge) throw new ApiError('bad graphql payload', 0);
+        return {
+          users: (edge.edges || []).map((e) => this._mapGraph(e.node)),
+          next: edge.page_info?.has_next_page ? edge.page_info.end_cursor : null,
+          total: edge.count ?? null,
+        };
+      } catch (err) {
+        if (err instanceof RateLimit) throw err;
+        return this._pageApi(kind, after, id);
+      }
+    },
+    async _pageApi(kind, after, id) {
+      const maxId = after ? `&max_id=${encodeURIComponent(after)}` : '';
+      const surface = kind === 'followers' ? '&search_surface=follow_list_page' : '';
+      const url = `https://${HOST}/api/v1/friendships/${id}/${kind}/?count=${PAGE_SIZE}${surface}${maxId}`;
+      const body = await this.request(url);
+      if (!Array.isArray(body?.users)) throw new ApiError('bad api/v1 payload', 0);
+      return { users: body.users.map((u) => this._mapApi(u)), next: body.next_max_id || null, total: null };
+    },
+    // First 5 highlights (title + cover only). api/v1 tray primary, GraphQL fallback.
+    async getHighlights(userId) {
+      try {
+        const body = await this.request(`https://${HOST}/api/v1/highlights/${userId}/highlights_tray/`);
+        const tray = body?.tray || [];
+        return {
+          count: tray.length,
+          items: tray.slice(0, 5).map((t) => ({
+            id: String(t.id), title: t.title || '',
+            cover: t.cover_media?.cropped_image_version?.url || t.cover_media?.image_versions2?.candidates?.[0]?.url || '',
+          })),
+        };
+      } catch (err) {
+        if (err instanceof RateLimit) throw err;
+        const vars = { user_id: userId, include_chaining: false, include_reel: false, include_suggested_users: false, include_logged_out_extras: false, include_highlight_reels: true, include_live_status: false };
+        const body = await this.request(`https://${HOST}/graphql/query/?query_hash=${HASH.highlights}&variables=${encodeURIComponent(JSON.stringify(vars))}`);
+        const edges = body?.data?.user?.edge_highlight_reels?.edges || [];
+        return {
+          count: edges.length,
+          items: edges.slice(0, 5).map((e) => ({
+            id: String(e.node.id), title: e.node.title || '',
+            cover: e.node.cover_media_cropped_thumbnail?.url || e.node.cover_media?.thumbnail_src || '',
+          })),
+        };
+      }
+    },
+  };
+
+  // Paginate a whole list (followers|following) of `userId` with human pacing.
+  const scanList = async (kind, onProgress, userId, shouldCancel) => {
+    const users = [], seen = new Set();
+    let after = null, total = null, pages = 0;
+    for (;;) {
+      const res = await api.page(kind, after, userId);
+      if (res.total != null) total = res.total;
+      for (const u of res.users) if (!seen.has(u.id)) { seen.add(u.id); users.push(u); }
+      pages += 1;
+      onProgress(kind, users.length, total);
+      if (shouldCancel?.()) throw new Error('cancelled');
+      after = res.next;
+      if (!after) return users;
+      await sleep(pages % 6 === 0 ? randInt(4000, 8000) : randInt(700, 1700));
+    }
+  };
+
+  // ==========================================================================
+  // Global action queue — ONE paced/rate-limit-safe queue for every tool.
+  // Modules register a handler per `kind` ({ run, onDone?, onFail? }); the
+  // engine owns pacing, exponential backoff, rate-limit pause/auto-resume and
+  // persistence (survives refresh). Clones the followaccount ActionQueue.
+  // ==========================================================================
+  const QKEY = 'igs-queue';
+  const SPEEDS = {
+    safe: { min: 45000, max: 90000, label: 'Safe · 45–90s' },
+    normal: { min: 25000, max: 50000, label: 'Normal · 25–50s' },
+    fast: { min: 12000, max: 25000, label: 'Fast · 12–25s ⚠' },
+  };
+  const MAX_RETRIES = 4;
+  const RL_WAIT_MS = 10 * 60 * 1000;
+  const KIND_VERB = { unfollow: 'Unfollowing', follow: 'Following', cancel: 'Cancelling', verify: 'Checking', 'fm-follow': 'Following', 'fm-unfollow': 'Unfollowing' };
+
+  const queue = {
+    items: [], paused: false, cooldownUntil: 0, rateLimitedUntil: 0, speedKey: 'safe',
+    _busy: false, _timer: null, handlers: {},
+
+    register(kind, handler) { this.handlers[kind] = handler; },
+    load() {
+      const s = store.get(QKEY, null);
+      if (!s || !Array.isArray(s.items)) return;
+      this.items = s.items; this.paused = !!s.paused;
+      this.cooldownUntil = s.cooldownUntil || 0; this.speedKey = s.speedKey || 'safe';
+      this.items.forEach((i) => { if (i.status === 'running') { i.status = 'pending'; i.nextRunAt = Date.now() + randInt(4000, 12000); } });
+    },
+    persist() { store.save(QKEY, { items: this.items, paused: this.paused, cooldownUntil: this.cooldownUntil, speedKey: this.speedKey }); },
+    speed() { return SPEEDS[this.speedKey] || SPEEDS.safe; },
+    statusOf(userId, kind) {
+      const it = this.items.find((i) => i.userId === userId && (!kind || i.kind === kind));
+      return it?.status ?? null;
+    },
+    summary() {
+      const c = { pending: 0, running: 0, done: 0, failed: 0 };
+      this.items.forEach((i) => { c[i.status] = (c[i.status] || 0) + 1; });
+      return c;
+    },
+    add(item) {
+      if (this.items.some((i) => i.userId === item.userId && i.kind === item.kind && i.status !== 'failed')) return false;
+      this.items.push({ id: uid(), status: 'pending', attempts: 0, nextRunAt: Date.now(), ...item });
+      return true;
+    },
+    enqueue(items) {
+      const added = items.reduce((acc, it) => acc + (this.add(it) ? 1 : 0), 0);
+      if (added) { this.paused = false; this.persist(); this.start(); this.changed(); }
+      return added;
+    },
+    removeItem(id) { this.items = this.items.filter((i) => i.id !== id || i.status === 'running'); this.persist(); this.changed(); },
+    cancelPending() { this.items = this.items.filter((i) => i.status === 'running' || i.status === 'done'); this.persist(); this.changed(); },
+    clearFinished() { this.items = this.items.filter((i) => i.status === 'pending' || i.status === 'running'); this.persist(); this.changed(); },
+    retryItem(id) {
+      const it = this.items.find((i) => i.id === id);
+      if (it && it.status === 'failed') { it.status = 'pending'; it.attempts = 0; it.nextRunAt = Date.now(); it.error = undefined; this.persist(); this.start(); this.changed(); }
+    },
+    pause() { this.paused = true; this.persist(); this.changed(); },
+    resume() { this.paused = false; this.rateLimitedUntil = 0; this.persist(); this.start(); this.changed(); },
+    start() { if (!this._timer) this._timer = setInterval(() => this.tick(), 1000); },
+    stop() { if (this._timer) { clearInterval(this._timer); } this._timer = null; },
+    etaMs() {
+      const pending = this.summary().pending;
+      if (!pending) return 0;
+      const sp = this.speed();
+      return Math.max(0, this.cooldownUntil - Date.now()) + pending * (sp.min + sp.max) / 2;
+    },
+    changed() { onQueueChange(); },
+
+    async tick() {
+      onQueueTick();
+      if (this.rateLimitedUntil && Date.now() >= this.rateLimitedUntil) {
+        this.rateLimitedUntil = 0;
+        if (this.paused) { this.paused = false; this.persist(); this.changed(); }
+      }
+      if (this._busy || this.paused) return;
+      const now = Date.now();
+      if (now < this.cooldownUntil || now < this.rateLimitedUntil) return;
+      const item = this.items.find((i) => i.status === 'pending' && i.nextRunAt <= now);
+      if (!item) return;
+      const handler = this.handlers[item.kind];
+      if (!handler) { item.status = 'failed'; item.error = 'no handler'; this.persist(); this.changed(); return; }
+
+      this._busy = true; item.status = 'running'; item.attempts += 1; this.persist(); this.changed();
+      try {
+        const res = await handler.run(item);
+        item.status = 'done';
+        handler.onDone?.(item, res);
+      } catch (err) {
+        if (err instanceof RateLimit) this._onRateLimit(item);
+        else this._onFailure(item, err, handler);
+      } finally {
+        const sp = this.speed();
+        this.cooldownUntil = Date.now() + randInt(sp.min, sp.max);
+        this._busy = false; this.persist(); this.changed();
+      }
+    },
+    _onFailure(item, err, handler) {
+      item.error = String(err?.message || err);
+      if (err instanceof ApiError && err.status === 404) { item.status = 'failed'; }
+      else if (item.attempts >= MAX_RETRIES) { item.status = 'failed'; }
+      else { item.status = 'pending'; item.nextRunAt = Date.now() + Math.min(16, 2 ** (item.attempts - 1)) * 60000; }
+      if (item.status === 'failed') handler.onFail?.(item, err);
+    },
+    _onRateLimit(item) {
+      item.status = 'pending'; item.attempts = Math.max(0, item.attempts - 1);
+      item.nextRunAt = Date.now() + RL_WAIT_MS;
+      this.paused = true; this.rateLimitedUntil = Date.now() + RL_WAIT_MS;
+    },
+  };
+
+  // ==========================================================================
+  // Shared UI helpers
+  // ==========================================================================
+  const avatar = (u) => {
+    const letter = esc((u.username || '?').charAt(0).toUpperCase());
+    return u.picUrl
+      ? `<img class="av" loading="lazy" src="${esc(u.picUrl)}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'av',textContent:'${letter}'}))">`
+      : `<div class="av">${letter}</div>`;
+  };
+  const badge = (label, cls = '') => `<span class="badge ${cls}">${esc(label)}</span>`;
+  const profileLink = (username) => `<a href="https://www.instagram.com/${encodeURIComponent(username)}/" target="_blank" rel="noreferrer">@${esc(username)}</a>`;
+
+  const toast = (msg) => {
+    const t = document.createElement('div');
+    t.className = 'igs-toast';
+    t.textContent = msg;
+    root.appendChild(t);
+    setTimeout(() => t.remove(), 4200);
+  };
+
+  // ==========================================================================
+  // Styles — one Müller-Brockmann design system for all three tools
+  // ==========================================================================
+  const CSS = [
+    '#igs-root,#igs-root *{box-sizing:border-box;margin:0;padding:0;}',
+    '#igs-root{position:fixed;inset:0;z-index:2147483647;background:#fff;color:#111;',
+    'font-family:Inter,-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif;',
+    'font-size:15px;line-height:1.5;overflow:auto;-webkit-font-smoothing:antialiased;',
+    '--accent:#e4002b;--mut:#6b6b6b;--line:#111;--hair:#e3e3e3;--ok:#0a7d28;--blue:#0a558c;',
+    '--mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;}',
+    '#igs-root .wrap{max-width:1180px;margin:0 auto;padding:0 32px 110px;}',
+    // top bar + nav
+    '#igs-root .top{position:sticky;top:0;z-index:6;background:#fff;border-bottom:2px solid var(--line);',
+    'display:flex;align-items:center;gap:18px;padding:16px 0;margin-bottom:8px;flex-wrap:wrap;}',
+    '#igs-root .brand{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;}',
+    '#igs-root .brand b{display:block;font-family:Inter,sans-serif;font-size:21px;letter-spacing:-.02em;font-weight:800;text-transform:none;}',
+    '#igs-root .nav{display:flex;gap:0;border:2px solid var(--line);}',
+    '#igs-root .nav button{border:none;border-right:2px solid var(--line);background:#fff;color:#111;min-height:42px;padding:0 18px;',
+    'font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;font-weight:600;}',
+    '#igs-root .nav button:last-child{border-right:none;}',
+    '#igs-root .nav button.on{background:var(--accent);color:#fff;}',
+    '#igs-root .nav button:hover:not(.on){background:#111;color:#fff;}',
+    '#igs-root .spacer{flex:1;}',
+    '#igs-root .who{font-family:var(--mono);font-size:11px;color:var(--mut);text-align:right;line-height:1.4;}',
+    // buttons (≥44px targets, AA contrast)
+    '#igs-root button{font:inherit;cursor:pointer;border:2px solid var(--line);background:#fff;color:#111;',
+    'min-height:44px;padding:0 16px;font-weight:600;letter-spacing:.01em;transition:background .12s,color .12s;}',
+    '#igs-root button:hover{background:#111;color:#fff;}',
+    '#igs-root button.primary{background:var(--accent);border-color:var(--accent);color:#fff;}',
+    '#igs-root button.primary:hover{background:#b80023;border-color:#b80023;}',
+    '#igs-root button.ghost{border-color:var(--hair);min-height:38px;padding:0 12px;}',
+    '#igs-root button.danger{border-color:var(--accent);color:var(--accent);}',
+    '#igs-root button.danger:hover{background:var(--accent);color:#fff;}',
+    '#igs-root button:disabled{opacity:.4;cursor:not-allowed;}',
+    '#igs-root .iconbtn{min-height:44px;min-width:44px;padding:0;font-size:20px;line-height:1;}',
+    // kicker + sections
+    '#igs-root .kicker{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut);margin:34px 0 12px;}',
+    '#igs-root .kicker .accent{color:var(--accent);}',
+    '#igs-root .note{font-family:var(--mono);font-size:12px;color:var(--mut);margin:14px 0;}',
+    '#igs-root .warn{border-left:3px solid var(--accent);background:#fff5f6;padding:12px 14px;font-size:13px;margin:14px 0;}',
+    // metric/stat grid (big numerals)
+    '#igs-root .metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--hair);border:1px solid var(--hair);}',
+    '#igs-root .metric{background:#fff;padding:18px 16px 16px;min-height:104px;}',
+    '#igs-root .metric .v{font-size:38px;font-weight:800;letter-spacing:-.03em;line-height:1;font-variant-numeric:tabular-nums;}',
+    '#igs-root .metric .l{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);margin-top:10px;}',
+    '#igs-root .metric .d{font-family:var(--mono);font-size:12px;margin-top:6px;font-variant-numeric:tabular-nums;}',
+    '#igs-root .metric .d.up{color:#111;} #igs-root .metric .d.down{color:var(--accent);font-weight:700;}',
+    // chart
+    '#igs-root .chartbox{border:1px solid var(--hair);padding:20px 20px 12px;}',
+    '#igs-root .chartbox svg{display:block;width:100%;height:200px;}',
+    '#igs-root .legend{font-family:var(--mono);font-size:11px;color:var(--mut);display:flex;gap:20px;margin-top:8px;}',
+    '#igs-root .legend i{display:inline-block;width:16px;height:0;border-top:3px solid;vertical-align:middle;margin-right:6px;}',
+    // tabs
+    '#igs-root .tabs{display:flex;flex-wrap:wrap;gap:0;border-bottom:2px solid var(--line);margin:8px 0 0;}',
+    '#igs-root .tab{border:none;border-bottom:3px solid transparent;background:none;min-height:46px;padding:0 16px;',
+    'font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);}',
+    '#igs-root .tab:hover{background:none;color:#111;}',
+    '#igs-root .tab.on{color:#111;border-bottom-color:var(--accent);font-weight:700;}',
+    '#igs-root .tab .n{font-weight:800;margin-left:6px;color:#111;}',
+    // toolbar + search + filters
+    '#igs-root .toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:18px 0 10px;}',
+    '#igs-root .toolbar h3{font-size:13px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--mut);font-weight:600;}',
+    '#igs-root input.search,#igs-root select,#igs-root input[type=number]{font:inherit;min-height:40px;border:2px solid var(--line);padding:0 10px;background:#fff;}',
+    '#igs-root input.search{flex:1;max-width:320px;}',
+    '#igs-root input.search:focus,#igs-root select:focus{outline:2px solid var(--accent);outline-offset:1px;}',
+    '#igs-root .chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 12px;}',
+    '#igs-root .chip{font-family:var(--mono);font-size:11px;letter-spacing:.04em;text-transform:uppercase;border:2px solid var(--hair);background:#fff;color:var(--mut);min-height:34px;padding:0 10px;}',
+    '#igs-root .chip.on{border-color:var(--accent);color:#fff;background:var(--accent);}',
+    // list rows
+    '#igs-root .rows{border-top:1px solid var(--hair);}',
+    '#igs-root .row{display:flex;align-items:center;gap:14px;padding:10px 4px;border-bottom:1px solid var(--hair);}',
+    '#igs-root .row.q-done{opacity:.5;}',
+    '#igs-root .av{width:44px;height:44px;border-radius:50%;flex:none;background:#f0f0f0;object-fit:cover;',
+    'display:flex;align-items:center;justify-content:center;font-weight:700;color:#999;font-size:16px;}',
+    '#igs-root .row .meta{min-width:0;flex:1;}',
+    '#igs-root .row .u{font-weight:600;}',
+    '#igs-root .row .u a{color:#111;text-decoration:none;}',
+    '#igs-root .row .u a:hover{text-decoration:underline;text-decoration-color:var(--accent);}',
+    '#igs-root .row .fn{color:var(--mut);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+    '#igs-root .row .when{font-family:var(--mono);font-size:11px;color:var(--mut);white-space:nowrap;}',
+    '#igs-root .badge{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;border:1px solid var(--hair);padding:3px 6px;color:var(--mut);white-space:nowrap;}',
+    '#igs-root .badge.v{border-color:#111;color:#111;} #igs-root .badge.red{border-color:var(--accent);color:var(--accent);}',
+    '#igs-root .badge.ok{border-color:var(--ok);color:var(--ok);} #igs-root .badge.blue{border-color:var(--blue);color:var(--blue);}',
+    '#igs-root .empty{color:var(--mut);padding:36px 4px;font-family:var(--mono);font-size:13px;}',
+    '#igs-root .more{color:var(--mut);font-family:var(--mono);font-size:12px;padding:14px 4px;}',
+    // checkboxes + per-row action buttons
+    '#igs-root .ck{width:22px;height:22px;flex:none;accent-color:var(--accent);cursor:pointer;}',
+    '#igs-root .ckwrap{display:flex;align-items:center;justify-content:center;min-width:44px;min-height:44px;margin:-10px 0 -10px -4px;cursor:pointer;}',
+    '#igs-root .actbtn{min-height:36px;padding:0 12px;border:2px solid var(--accent);background:#fff;color:var(--accent);font-size:12px;font-weight:700;white-space:nowrap;}',
+    '#igs-root .actbtn:hover{background:var(--accent);color:#fff;}',
+    '#igs-root .actbtn.plain{border-color:var(--line);color:#111;}',
+    '#igs-root .actbtn.plain:hover{background:#111;color:#fff;}',
+    '#igs-root .qbadge{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;white-space:nowrap;border:1px solid var(--hair);color:var(--mut);}',
+    '#igs-root .qbadge.pending{border-color:#111;color:#111;} #igs-root .qbadge.running{border-color:var(--accent);color:var(--accent);}',
+    '#igs-root .qbadge.done{border-color:var(--ok);color:var(--ok);} #igs-root .qbadge.failed{border-color:var(--accent);color:#fff;background:var(--accent);}',
+    // selection toolbar
+    '#igs-root .seltool{display:flex;align-items:center;flex-wrap:wrap;gap:10px;border:2px solid var(--line);padding:10px 12px;margin:14px 0 6px;background:#fafafa;}',
+    '#igs-root .seltool .sc{font-family:var(--mono);font-size:12px;color:var(--mut);}',
+    '#igs-root .seltool .sc b{color:#111;font-size:14px;}',
+    '#igs-root .seltool .sp{flex:1;}',
+    // cards (followers module)
+    '#igs-root .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1px;background:var(--hair);border:1px solid var(--hair);margin-top:8px;}',
+    '#igs-root .card{background:#fff;padding:14px;display:flex;flex-direction:column;gap:8px;}',
+    '#igs-root .card .chead{display:flex;gap:10px;align-items:center;}',
+    '#igs-root .card .thumbs{display:flex;gap:4px;}',
+    '#igs-root .card .thumbs img{width:33%;aspect-ratio:1;object-fit:cover;background:#f0f0f0;}',
+    '#igs-root .card .hl{display:flex;gap:6px;flex-wrap:wrap;}',
+    '#igs-root .card .hl span{font-family:var(--mono);font-size:10px;color:var(--mut);border:1px solid var(--hair);padding:2px 5px;}',
+    '#igs-root .card .cact{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto;}',
+    // dropzone
+    '#igs-root .drop{border:2px dashed var(--line);padding:40px 20px;text-align:center;font-family:var(--mono);font-size:13px;color:var(--mut);cursor:pointer;}',
+    '#igs-root .drop.over{border-color:var(--accent);background:#fff5f6;color:#111;}',
+    // queue panel (fixed bottom bar)
+    '#igs-root .qpanel{position:fixed;left:0;right:0;bottom:0;z-index:15;background:#111;color:#fff;',
+    'display:flex;align-items:center;gap:16px;padding:12px 24px;border-top:3px solid var(--accent);}',
+    '#igs-root .qpanel .qstat{font-family:var(--mono);font-size:12px;line-height:1.45;white-space:nowrap;}',
+    '#igs-root .qpanel .qstat b{font-size:15px;}',
+    '#igs-root .qpanel .qbar{flex:1;height:6px;background:#333;min-width:80px;}',
+    '#igs-root .qpanel .qbar i{display:block;height:100%;background:var(--accent);transition:width .4s;}',
+    '#igs-root .qpanel .qnext{font-family:var(--mono);font-size:12px;color:#ccc;white-space:nowrap;}',
+    '#igs-root .qpanel button{min-height:38px;padding:0 12px;border-color:#555;background:#111;color:#fff;}',
+    '#igs-root .qpanel button:hover{background:#fff;color:#111;}',
+    '#igs-root .qpanel button.primary{background:var(--accent);border-color:var(--accent);}',
+    '#igs-root .qpanel.rl{background:#5a0011;}',
+    '#igs-root select{font-family:var(--mono);}',
+    // scan overlay
+    '#igs-root .scan{position:fixed;inset:0;background:rgba(255,255,255,.97);z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;}',
+    '#igs-root .radar{position:relative;width:140px;height:140px;}',
+    '#igs-root .radar .ring{position:absolute;inset:0;border:3px solid var(--accent);border-radius:50%;animation:igspulse 1.8s ease-out infinite;}',
+    '#igs-root .radar .ring:nth-child(2){animation-delay:.6s;} #igs-root .radar .ring:nth-child(3){animation-delay:1.2s;}',
+    '#igs-root .radar .sweep{position:absolute;inset:0;border-radius:50%;border-top:3px solid #111;animation:igsspin 1s linear infinite;}',
+    '@keyframes igspulse{0%{transform:scale(.2);opacity:.9;}100%{transform:scale(1);opacity:0;}}',
+    '@keyframes igsspin{to{transform:rotate(360deg);}}',
+    '#igs-root .scan .lot{width:140px;height:140px;position:absolute;}',
+    '#igs-root .scan .st{font-family:var(--mono);font-size:13px;margin-top:24px;text-align:center;}',
+    '#igs-root .scan .pct{font-size:60px;font-weight:800;letter-spacing:-.04em;font-variant-numeric:tabular-nums;}',
+    '#igs-root .scan .bar{width:280px;height:6px;background:var(--hair);margin-top:8px;}',
+    '#igs-root .scan .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s;}',
+    '#igs-root .igs-toast{position:fixed;left:50%;bottom:86px;transform:translateX(-50%);background:#111;color:#fff;font:600 13px Inter,sans-serif;padding:12px 18px;z-index:2147483647;border-left:3px solid var(--accent);}',
+    '@media(max-width:880px){#igs-root .metrics{grid-template-columns:repeat(3,1fr);}#igs-root .wrap{padding:0 16px 110px;}}',
+    '@media(max-width:520px){#igs-root .metrics{grid-template-columns:repeat(2,1fr);}}',
+  ].join('');
+
+  // Lottie scan animation (progressive enhancement over the CSS radar)
+  const LOTTIE_RING = {
+    v: '5.9.0', fr: 60, ip: 0, op: 120, w: 120, h: 120, nm: 'scan', ddd: 0, assets: [],
+    layers: [{
+      ddd: 0, ind: 1, ty: 4, nm: 'ring', sr: 1,
+      ks: { o: { a: 0, k: 100 }, r: { a: 1, k: [{ t: 0, s: [0] }, { t: 120, s: [360] }] }, p: { a: 0, k: [60, 60, 0] }, a: { a: 0, k: [0, 0, 0] }, s: { a: 0, k: [100, 100, 100] } },
+      shapes: [{ ty: 'gr', it: [
+        { ty: 'el', p: { a: 0, k: [0, 0] }, s: { a: 0, k: [86, 86] } },
+        { ty: 'st', c: { a: 0, k: [0.894, 0, 0.168, 1] }, o: { a: 0, k: 100 }, w: { a: 0, k: 6 }, lc: 2, lj: 2 },
+        { ty: 'tm', s: { a: 0, k: 0 }, e: { a: 1, k: [{ t: 0, s: [15] }, { t: 60, s: [85] }, { t: 120, s: [15] }] }, o: { a: 0, k: 0 }, m: 1 },
+        { ty: 'tr', p: { a: 0, k: [0, 0] }, a: { a: 0, k: [0, 0] }, s: { a: 0, k: [100, 100] }, r: { a: 0, k: 0 }, o: { a: 0, k: 100 } },
+      ] }],
+      ip: 0, op: 120, st: 0, bm: 0,
+    }],
+  };
+  const tryLottie = (container, cssFallback) => {
+    const mount = () => {
+      try {
+        const anim = globalThis.lottie.loadAnimation({ container, renderer: 'svg', loop: true, autoplay: true, animationData: LOTTIE_RING });
+        anim.addEventListener('DOMLoaded', () => { if (cssFallback) cssFallback.style.opacity = '0'; });
+      } catch { /* keep CSS fallback */ }
+    };
+    try {
+      if (globalThis.lottie?.loadAnimation) return mount();
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/lottie-web@5.12.2/build/player/lottie_light.min.js';
+      s.onload = mount;
+      s.onerror = () => { /* CSP/offline: CSS radar stays */ };
+      document.head.appendChild(s);
+    } catch { /* keep CSS fallback */ }
+  };
+  // Generic scan overlay used by Ledger + Followers
+  const scanOverlay = (label) => {
+    const el = document.createElement('div');
+    el.className = 'scan';
+    el.innerHTML =
+      '<div class="radar"><div class="lot"></div><div class="ring"></div><div class="ring"></div><div class="ring"></div><div class="sweep"></div></div>' +
+      '<div class="pct" data-pct>0%</div><div class="bar"><i data-prog></i></div>' +
+      `<div class="st" data-st>${esc(label || 'Starting…')}</div>` +
+      '<button class="ghost" data-cancel style="margin-top:20px">Cancel</button>';
+    root.appendChild(el);
+    tryLottie($('.lot', el), $('.radar', el));
+    return el;
+  };
+
+  // Growth chart (pure SVG, no deps)
+  const chartSVG = (timeline) => {
+    if (!timeline || timeline.length < 2) return '<div class="empty">Growth chart appears after your second scan.</div>';
+    const W = 1000, H = 200, pad = { l: 8, r: 8, t: 14, b: 22 };
+    const xs = timeline.map((p) => p.ts);
+    const ys = timeline.flatMap((p) => [p.f, p.g]);
+    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys);
+    let maxY = Math.max(...ys);
+    if (maxY === minY) maxY = minY + 1;
+    const sx = (t) => pad.l + (maxX === minX ? 0 : (t - minX) / (maxX - minX)) * (W - pad.l - pad.r);
+    const sy = (v) => pad.t + (1 - (v - minY) / (maxY - minY)) * (H - pad.t - pad.b);
+    const path = (key) => timeline.map((p, i) => `${i ? 'L' : 'M'}${sx(p.ts).toFixed(1)} ${sy(p[key]).toFixed(1)}`).join(' ');
+    const fArea = `${path('f')} L${sx(maxX).toFixed(1)} ${H - pad.b} L${sx(minX).toFixed(1)} ${H - pad.b} Z`;
+    const dots = timeline.map((p) => `<circle cx="${sx(p.ts).toFixed(1)}" cy="${sy(p.f).toFixed(1)}" r="2.5" fill="#111"/>`).join('');
+    const first = timeline[0], last = timeline[timeline.length - 1];
+    return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+      `<line x1="${pad.l}" y1="${H - pad.b}" x2="${W - pad.r}" y2="${H - pad.b}" stroke="#e3e3e3"/>` +
+      `<path d="${fArea}" fill="#f6f6f6"/><path d="${path('g')}" fill="none" stroke="#bbb" stroke-width="2"/>` +
+      `<path d="${path('f')}" fill="none" stroke="#e4002b" stroke-width="2.5"/>${dots}` +
+      `<text x="${pad.l}" y="14" font-family="monospace" font-size="11" fill="#6b6b6b">${new Date(first.ts).toLocaleDateString()}</text>` +
+      `<text x="${W - pad.r}" y="14" text-anchor="end" font-family="monospace" font-size="11" fill="#6b6b6b">${new Date(last.ts).toLocaleDateString()}</text></svg>`;
+  };
+
+  // ==========================================================================
+  // Module registry + SPA shell
+  // ==========================================================================
+  let root, view;
+  const modules = [];
+  const shell = { active: null };
+
+  const mountModule = (id) => {
+    const mod = modules.find((m) => m.id === id);
+    if (!mod || shell.active?.id === id) return;
+    shell.active?.unmount?.();
+    shell.active = mod;
+    $$('.nav button', root).forEach((b) => b.classList.toggle('on', b.dataset.mod === id));
+    view.innerHTML = '';
+    mod.mount(view);
+  };
+
+  const renderShell = () => {
+    const navHTML = modules.map((m) => `<button data-mod="${m.id}">${esc(m.label)}</button>`).join('');
+    root.innerHTML =
+      '<div class="wrap">' +
+        '<div class="top">' +
+          '<div class="brand">Instagram<b>Suite</b></div>' +
+          `<div class="nav">${navHTML}</div>` +
+          '<div class="spacer"></div>' +
+          `<div class="who">viewer #${esc(api.viewerId || '—')}${api.loggedIn ? '' : '<br>⚠ not on instagram.com'}</div>` +
+          '<button class="iconbtn" data-close title="Close">✕</button>' +
+        '</div>' +
+        '<div id="igs-view"></div>' +
+      '</div>';
+    view = $('#igs-view', root);
+    $('[data-close]', root).onclick = () => teardown();
+    $$('.nav button', root).forEach((b) => { b.onclick = () => mountModule(b.dataset.mod); });
+  };
+
+  // ---- global queue panel (shell-level) ------------------------------------
+  const queueNextText = () => {
+    const c = queue.summary();
+    if (Date.now() < queue.rateLimitedUntil) return `Rate-limited — auto-resume in ${Math.ceil((queue.rateLimitedUntil - Date.now()) / 60000)}m`;
+    if (queue.paused) return `Paused — ${c.pending} waiting`;
+    if (queue._busy) {
+      const r = queue.items.find((i) => i.status === 'running');
+      return `${KIND_VERB[r?.kind] || 'Working'} @${r?.username || ''}…`;
+    }
+    if (c.pending) return `Next in ${fmtCountdown(Math.max(0, queue.cooldownUntil - Date.now()))} · ETA ${fmtCountdown(queue.etaMs())}`;
+    return c.failed ? `Finished — ${c.failed} failed` : 'All done';
+  };
+  const queueBarPct = () => { const t = queue.items.length; return t ? Math.round(queue.summary().done / t * 100) : 0; };
+  const renderQueuePanel = () => {
+    if (!root) return;
+    let el = $('#igs-queue', root);
+    if (!queue.items.length) { el?.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.id = 'igs-queue'; root.appendChild(el); }
+    const c = queue.summary(), total = queue.items.length;
+    const failedTxt = c.failed ? ` · ${c.failed} failed` : '';
+    el.className = `qpanel${Date.now() < queue.rateLimitedUntil ? ' rl' : ''}`;
+    const speedOpts = Object.entries(SPEEDS).map(([k, sp]) => `<option value="${k}"${queue.speedKey === k ? ' selected' : ''}>${esc(sp.label)}</option>`).join('');
+    el.innerHTML =
+      `<div class="qstat"><b>${fmt(c.done)}</b>/${fmt(total)} done${failedTxt}</div>` +
+      `<div class="qbar"><i style="width:${queueBarPct()}%"></i></div>` +
+      `<div class="qnext" data-qnext>${esc(queueNextText())}</div>` +
+      `<select data-qspeed>${speedOpts}</select>` +
+      (queue.paused ? '<button class="primary" data-q="resume">Resume</button>' : '<button data-q="pause">Pause</button>') +
+      '<button data-q="cancel">Cancel pending</button>' +
+      (c.done || c.failed ? '<button data-q="clear">Clear done</button>' : '');
+    $$('[data-q]', el).forEach((b) => { b.onclick = () => qAction(b.dataset.q); });
+    const sp = $('[data-qspeed]', el);
+    if (sp) sp.onchange = () => { queue.speedKey = sp.value; queue.persist(); renderQueuePanel(); };
+  };
+  const qAction = (a) => {
+    if (a === 'pause') queue.pause();
+    else if (a === 'resume') queue.resume();
+    else if (a === 'cancel') { if (confirm('Cancel all pending actions? (in-flight one finishes)')) queue.cancelPending(); }
+    else if (a === 'clear') queue.clearFinished();
+  };
+  const onQueueTick = () => {
+    const el = $('#igs-queue', root);
+    if (!el || !queue.items.length) return;
+    const nb = $('[data-qnext]', el); if (nb) nb.textContent = queueNextText();
+    const bar = el.querySelector('.qbar i'); if (bar) bar.style.width = `${queueBarPct()}%`;
+  };
+  const onQueueChange = () => { shell.active?.onQueueChange?.(); renderQueuePanel(); };
+
+  const teardown = () => {
+    queue.stop();
+    shell.active?.unmount?.();
+    root?.remove();
+    document.getElementById('igs-style')?.remove();
+  };
+
+  // ##########################################################################
+  // MODULE: Ledger — scan YOUR followers/following, diff, dashboard, unfollow
+  // ##########################################################################
+  const ledger = (() => {
+    const K = { current: 'igs-ledger-current', previous: 'igs-ledger-previous', timeline: 'igs-ledger-timeline', events: 'igs-ledger-events' };
+    const EVENTS_LIMIT = 1500, TIMELINE_LIMIT = 300;
+    const UNFOLLOW_TABS = { following: 1, mutuals: 1, nonfollowers: 1 };
+    const EMPTY_AN = { followers: [], following: [], mutuals: [], fans: [], nonFollowers: [], verified: [], private: [] };
+    const st = { tab: 'gained', query: '', scanning: false, selected: new Set() };
+    let MODEL = null, container = null;
+
+    const not = (list, other) => (list || []).filter((u) => !other[u.id]);
+    const inter = (list, other) => (list || []).filter((u) => other[u.id]);
+    const computeDiff = (prev, curr) => {
+      if (!prev) return null;
+      const cf = byId(curr.followers), cg = byId(curr.following);
+      return {
+        gained: not(curr.followers, byId(prev.followers)), lost: not(prev.followers, cf),
+        startedFollowing: not(curr.following, byId(prev.following)), stoppedFollowing: not(prev.following, cg),
+      };
+    };
+    const analyze = (snap) => {
+      const fMap = byId(snap.followers), gMap = byId(snap.following);
+      return {
+        followers: snap.followers, following: snap.following,
+        mutuals: inter(snap.following, fMap), fans: not(snap.followers, gMap), nonFollowers: not(snap.following, fMap),
+        verified: snap.followers.filter((u) => u.isVerified), private: snap.followers.filter((u) => u.isPrivate),
+      };
+    };
+    const rebuildModel = () => {
+      const curr = store.get(K.current, null), prev = store.get(K.previous, null);
+      MODEL = { curr, prev, timeline: store.get(K.timeline, []), events: store.get(K.events, []), an: curr ? analyze(curr) : EMPTY_AN, diff: computeDiff(prev, curr) };
+      return MODEL;
+    };
+    const commitScan = (curr) => {
+      const prev = store.get(K.current, null);
+      const diff = computeDiff(prev, curr);
+      if (diff) {
+        let events = store.get(K.events, []);
+        const push = (arr, type) => { for (const u of arr) events.push({ ts: curr.ts, type, id: u.id, username: u.username, fullName: u.fullName, isVerified: u.isVerified }); };
+        push(diff.gained, 'gained'); push(diff.lost, 'lost'); push(diff.startedFollowing, 'followed'); push(diff.stoppedFollowing, 'unfollowed');
+        if (events.length > EVENTS_LIMIT) events = events.slice(-EVENTS_LIMIT);
+        store.save(K.events, events);
+      }
+      let timeline = store.get(K.timeline, []);
+      timeline.push({ ts: curr.ts, f: curr.counts.followers, g: curr.counts.following });
+      if (timeline.length > TIMELINE_LIMIT) timeline = timeline.slice(-TIMELINE_LIMIT);
+      store.save(K.timeline, timeline);
+      if (prev) store.save(K.previous, prev);
+      const storedOk = store.save(K.current, curr);
+      return { diff, storedOk };
+    };
+    // queue 'unfollow' handler: drop from following snapshot + log on success
+    const afterUnfollow = (item) => {
+      const curr = store.get(K.current, null);
+      if (curr) {
+        const before = curr.following.length;
+        curr.following = curr.following.filter((u) => u.id !== item.userId);
+        if (curr.following.length !== before) { curr.counts.following = curr.following.length; store.save(K.current, curr); }
+        let events = store.get(K.events, []);
+        events.push({ ts: Date.now(), type: 'unfollowed', id: item.userId, username: item.username, fullName: item.fullName, isVerified: item.isVerified });
+        if (events.length > EVENTS_LIMIT) events = events.slice(-EVENTS_LIMIT);
+        store.save(K.events, events);
+      }
+      rebuildModel();
+    };
+
+    const rowOf = (u, opts = {}) => {
+      const qs = opts.queueAware ? queue.statusOf(u.id, 'unfollow') : null;
+      let badges = '';
+      if (u.isVerified) badges += badge('✓ verified', 'v');
+      if (u.isPrivate) badges += badge('private');
+      if (opts.badge) badges += badge(opts.badge, opts.badgeClass || '');
+      let right = '';
+      if (qs) {
+        const lab = { pending: 'queued', running: 'unfollowing…', done: 'unfollowed ✓', failed: 'failed' }[qs] || qs;
+        right = `<span class="qbadge ${qs}">${lab}</span>`;
+      } else if (opts.unfollowable) {
+        right = `<button class="actbtn" data-act="unfollow" data-uid="${esc(u.id)}">Unfollow</button>`;
+      }
+      const when = opts.when ? `<span class="when">${esc(opts.when)}</span>` : '';
+      let ck = '';
+      if (opts.selectable && qs) ck = '<span style="min-width:44px;flex:none"></span>';
+      else if (opts.selectable) {
+        const checked = st.selected.has(u.id) ? ' checked' : '';
+        ck = `<label class="ckwrap"><input type="checkbox" class="ck" data-uid="${esc(u.id)}"${checked}></label>`;
+      }
+      const fn = u.fullName ? `<div class="fn">${esc(u.fullName)}</div>` : '';
+      return `<div class="row${qs === 'done' ? ' q-done' : ''}">${ck}${avatar(u)}` +
+        `<div class="meta"><div class="u">${profileLink(u.username)}</div>${fn}</div>${badges}${when}${right}</div>`;
+    };
+    const listHTML = (users, opts = {}) => {
+      const q = st.query.toLowerCase();
+      const filtered = q ? users.filter((u) => u.username?.toLowerCase().includes(q) || u.fullName?.toLowerCase().includes(q)) : users;
+      if (!filtered.length) {
+        const hint = q ? ` for “${st.query}”` : '';
+        const msg = opts.empty || `Nothing here${hint}.`;
+        return `<div class="empty">${esc(msg)}</div>`;
+      }
+      const shown = filtered.slice(0, ROW_CAP);
+      let html = `<div class="rows">${shown.map((u) => rowOf(u, typeof opts.row === 'function' ? opts.row(u) : opts.row)).join('')}</div>`;
+      if (filtered.length > shown.length) html += `<div class="more">Showing first ${fmt(shown.length)} of ${fmt(filtered.length)} — search to narrow.</div>`;
+      return html;
+    };
+    const tabUsers = (key, M = MODEL) => {
+      const an = M.an, d = M.diff || { gained: [], lost: [] };
+      return ({ gained: d.gained, lost: d.lost, nonfollowers: an.nonFollowers, fans: an.fans, mutuals: an.mutuals, followers: an.followers, following: an.following })[key] || [];
+    };
+    const ACT_LABELS = { gained: ['new follower', ''], lost: ['unfollowed you', 'red'], followed: ['you followed', ''], unfollowed: ['you unfollowed', 'red'] };
+    const activityHTML = (events) => {
+      if (!events.length) return '<div class="empty">No history yet. Scans and unfollows are logged here.</div>';
+      const q = st.query.toLowerCase();
+      let feed = events.slice().reverse();
+      if (q) feed = feed.filter((e) => e.username?.toLowerCase().includes(q));
+      const rows = feed.slice(0, ROW_CAP).map((e) => {
+        const [b, bc] = ACT_LABELS[e.type] || [e.type, ''];
+        return rowOf(e, { badge: b, badgeClass: bc, when: fmtAgo(e.ts) });
+      }).join('');
+      return `<div class="rows">${rows}</div>`;
+    };
+    const tabDefs = (M) => {
+      const an = M.an, events = M.events, d = M.diff || { gained: [], lost: [], startedFollowing: [], stoppedFollowing: [] };
+      const uf = { selectable: true, unfollowable: true, queueAware: true };
+      return {
+        gained: { label: 'New followers', count: d.gained.length, render: () => listHTML(d.gained, { empty: 'No new followers since the previous scan.', row: { badge: 'new' } }) },
+        lost: { label: 'Removed follow', count: d.lost.length, render: () => listHTML(d.lost, { empty: 'Nobody unfollowed you since the previous scan.', row: { badge: 'unfollowed you', badgeClass: 'red' } }) },
+        nonfollowers: { label: "Don't follow back", count: an.nonFollowers.length, render: () => listHTML(an.nonFollowers, { empty: 'Everyone you follow follows you back.', row: uf }) },
+        fans: { label: 'Fans', count: an.fans.length, render: () => listHTML(an.fans, { empty: 'No one-way fans.', row: { badge: 'you don’t follow' } }) },
+        mutuals: { label: 'Mutuals', count: an.mutuals.length, render: () => listHTML(an.mutuals, { empty: 'No mutuals yet.', row: uf }) },
+        followers: { label: 'All followers', count: an.followers.length, render: () => listHTML(an.followers, { empty: 'No followers loaded — run a scan.' }) },
+        following: { label: 'Following', count: an.following.length, render: () => listHTML(an.following, { empty: 'Not following anyone, or no scan yet.', row: uf }) },
+        activity: { label: 'Activity', count: events.length, render: () => activityHTML(events) },
+      };
+    };
+    const metricsHTML = (M) => {
+      const curr = M.curr;
+      if (!curr) return '';
+      const an = M.an, d = M.diff;
+      const fc = curr.counts.followers, gc = curr.counts.following;
+      const netF = d ? d.gained.length - d.lost.length : null;
+      const ratio = fc ? gc / fc : null;
+      const metric = (v, l, dh = '') => `<div class="metric"><div class="v">${v}</div>${dh}<div class="l">${l}</div></div>`;
+      const delta = (n) => {
+        if (n == null) return '';
+        let cls = '', arrow = '';
+        if (n > 0) { cls = 'up'; arrow = '▲ '; } else if (n < 0) { cls = 'down'; arrow = '▼ '; }
+        return `<div class="d ${cls}">${arrow}${fmtDelta(n)} since last</div>`;
+      };
+      return metric(fmt(fc), 'Followers', delta(netF)) + metric(fmt(gc), 'Following') +
+        metric(d ? fmtDelta(d.gained.length) : '—', 'Gained', d ? '<div class="d up">new followers</div>' : '') +
+        metric(d ? fmtDelta(-d.lost.length) : '—', 'Removed', d ? '<div class="d down">unfollowed you</div>' : '') +
+        metric(fmt(an.mutuals.length), 'Mutuals') + metric(fmt(an.nonFollowers.length), 'No follow-back') +
+        metric(fmt(an.fans.length), 'Fans') + metric(fmt(an.verified.length), 'Verified') + metric(fmt(an.private.length), 'Private') +
+        metric(ratio == null ? '—' : ratio.toFixed(2), 'Follow ratio') +
+        metric(d ? fmtDelta(d.startedFollowing.length) : '—', 'You followed') +
+        metric(d ? fmtDelta(-d.stoppedFollowing.length) : '—', 'You unfollowed');
+    };
+    const selToolHTML = (M) => {
+      const selectable = tabUsers(st.tab, M).filter((u) => !queue.statusOf(u.id, 'unfollow'));
+      const n = st.selected.size;
+      return '<div class="seltool">' +
+        `<button class="ghost" data-sel="all">Select all (${fmt(selectable.length)})</button>` +
+        '<button class="ghost" data-sel="none">Clear</button>' +
+        `<span class="sc"><b data-selcount>${fmt(n)}</b> selected</span><span class="sp"></span>` +
+        `<button class="primary" data-sel="go"${n ? '' : ' disabled'}>Unfollow selected →</button></div>`;
+    };
+
+    const render = () => {
+      if (!MODEL) rebuildModel();
+      const M = MODEL, curr = M.curr, hasData = !!curr;
+      const tabs = tabDefs(M);
+      if (!tabs[st.tab]) st.tab = 'gained';
+      const firstScanNote = hasData && !M.prev ? '<div class="note">Baseline saved. Scan again later for a full change report.</div>' : '';
+      const tabOrder = ['gained', 'lost', 'nonfollowers', 'fans', 'mutuals', 'followers', 'following', 'activity'];
+      const tabsHTML = tabOrder.map((key) => `<button class="tab${st.tab === key ? ' on' : ''}" data-tab="${key}">${esc(tabs[key].label)}<span class="n">${fmt(tabs[key].count)}</span></button>`).join('');
+      const dashboard = hasData
+        ? `<div class="kicker"><span class="accent">●</span> Dashboard — ${esc(fmtDate(curr.ts))}</div>` +
+          `<div class="metrics" data-metrics>${metricsHTML(M)}</div>` +
+          '<div class="kicker">Growth over time</div>' +
+          `<div class="chartbox">${chartSVG(M.timeline)}<div class="legend"><span><i style="border-color:#e4002b"></i>followers</span><span><i style="border-color:#bbb"></i>following</span></div></div>`
+        : '<div class="kicker"><span class="accent">●</span> Getting started</div><div class="note">No snapshot yet. Hit <b>Scan now</b> to capture who follows you, then scan again to see who joined and who left.</div>';
+      container.innerHTML =
+        '<div class="toolbar"><h3>Your followers &amp; following</h3>' +
+          `<span class="note" style="margin:0">last scan: ${curr ? fmtAgo(curr.ts) : 'never'}</span><span class="sp" style="flex:1"></span>` +
+          '<button class="primary" data-scan>Scan now</button>' +
+          `<button class="ghost" data-export${hasData ? '' : ' disabled'}>Export</button></div>` +
+        firstScanNote + dashboard +
+        '<div class="kicker">Breakdown — select on Following / Mutuals / Don’t-follow-back to unfollow</div>' +
+        `<div class="tabs">${tabsHTML}</div>` +
+        (UNFOLLOW_TABS[st.tab] && hasData ? selToolHTML(M) : '') +
+        `<div class="toolbar"><h3>${esc(tabs[st.tab].label)}</h3><input class="search" data-search placeholder="Search username or name…" value="${esc(st.query)}"></div>` +
+        `<div data-list>${tabs[st.tab].render()}</div>`;
+      wire();
+    };
+    const refreshListBody = () => { const lb = $('[data-list]', container); if (lb && MODEL) lb.innerHTML = tabDefs(MODEL)[st.tab].render(); };
+    const updateSelCount = () => {
+      const c = $('[data-selcount]', container); if (c) c.textContent = fmt(st.selected.size);
+      const b = $('[data-sel="go"]', container); if (b) b.disabled = !st.selected.size;
+    };
+    const refreshDynamic = () => {
+      if (!MODEL || !container) return;
+      const tabs = tabDefs(MODEL);
+      if (!tabs[st.tab]) st.tab = 'gained';
+      const m = $('[data-metrics]', container); if (m) m.innerHTML = metricsHTML(MODEL);
+      $$('.tab', container).forEach((b) => { const t = tabs[b.dataset.tab]; const n = b.querySelector('.n'); if (n && t) n.textContent = fmt(t.count); });
+      refreshListBody(); updateSelCount();
+    };
+    const onTabClick = (e) => { st.tab = e.currentTarget.dataset.tab; render(); };
+    const onSelClick = (e) => selAction(e.currentTarget.dataset.sel);
+    const wire = () => {
+      $('[data-scan]', container).onclick = () => runScan();
+      const exp = $('[data-export]', container); if (exp) exp.onclick = exportJSON;
+      $$('.tab', container).forEach((b) => { b.onclick = onTabClick; });
+      const search = $('[data-search]', container); if (search) search.oninput = () => { st.query = search.value; refreshListBody(); };
+      $$('[data-sel]', container).forEach((b) => { b.onclick = onSelClick; });
+      const list = $('[data-list]', container);
+      if (list && !list._wired) {
+        list._wired = true;
+        list.addEventListener('change', (e) => { const t = e.target; if (t.classList?.contains('ck')) toggleSel(t.dataset.uid, t.checked); });
+        list.addEventListener('click', (e) => { const b = e.target.closest?.('[data-act="unfollow"]'); if (b) enqueueUnfollow([b.dataset.uid]); });
+      }
+    };
+    const toggleSel = (id, on) => { if (on) { st.selected.add(id); } else { st.selected.delete(id); } updateSelCount(); };
+    const selAction = (a) => {
+      if (a === 'all') { tabUsers(st.tab).forEach((u) => { if (!queue.statusOf(u.id, 'unfollow')) st.selected.add(u.id); }); refreshListBody(); updateSelCount(); }
+      else if (a === 'none') { st.selected.clear(); refreshListBody(); updateSelCount(); }
+      else if (a === 'go') unfollowSelected();
+    };
+    const enqueueUnfollow = (ids) => {
+      const fById = byId(MODEL.an.following);
+      const users = ids.map((id) => fById[id]).filter((u) => u && !queue.statusOf(u.id, 'unfollow'));
+      queue.enqueue(users.map((u) => ({ kind: 'unfollow', userId: u.id, username: u.username, fullName: u.fullName, isVerified: u.isVerified })));
+    };
+    const unfollowSelected = () => {
+      const fById = byId(MODEL.an.following);
+      const users = [...st.selected].map((id) => fById[id]).filter((u) => u && !queue.statusOf(u.id, 'unfollow'));
+      if (!users.length) return;
+      const sp = queue.speed();
+      const mins = Math.max(1, Math.round(users.length * ((sp.min + sp.max) / 2) / 60000));
+      if (!confirm(`Unfollow ${users.length} account(s)? One at a time on "${sp.label}" pace, ~${mins} min. Survives refresh; pause/cancel anytime.`)) return;
+      queue.enqueue(users.map((u) => ({ kind: 'unfollow', userId: u.id, username: u.username, fullName: u.fullName, isVerified: u.isVerified })));
+      st.selected.clear(); refreshDynamic();
+    };
+    const exportJSON = () => {
+      const dump = { exportedAt: new Date().toISOString(), current: store.get(K.current, null), previous: store.get(K.previous, null), timeline: store.get(K.timeline, []), events: store.get(K.events, []) };
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' }));
+      a.download = `instagram-ledger-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    };
+    const runScan = async () => {
+      if (st.scanning) return;
+      if (!api.loggedIn) { toast('Open instagram.com logged in to scan'); return; }
+      st.scanning = true;
+      let cancelled = false;
+      const ov = scanOverlay('Starting…');
+      $('[data-cancel]', ov).onclick = () => { cancelled = true; $('[data-st]', ov).textContent = 'Cancelling…'; };
+      const prevCount = store.get(K.current, null)?.counts ?? {};
+      const progress = (kind, loaded, total) => {
+        const base = kind === 'followers' ? 0 : 60, span = kind === 'followers' ? 60 : 40;
+        const known = total || prevCount[kind] || loaded + 1;
+        const pct = Math.min(100, Math.round(base + span * Math.min(1, loaded / Math.max(1, known))));
+        $('[data-prog]', ov).style.width = `${pct}%`;
+        $('[data-pct]', ov).textContent = `${pct}%`;
+        const totalTxt = total ? ` / ${fmt(total)}` : '';
+        $('[data-st]', ov).textContent = `Loading ${kind} — ${fmt(loaded)}${totalTxt}…`;
+      };
+      try {
+        const followers = await scanList('followers', progress, api.viewerId, () => cancelled);
+        const following = await scanList('following', progress, api.viewerId, () => cancelled);
+        $('[data-prog]', ov).style.width = '100%'; $('[data-pct]', ov).textContent = '100%';
+        const snap = { ts: Date.now(), counts: { followers: followers.length, following: following.length }, followers, following };
+        const out = commitScan(snap);
+        if (!out.storedOk) toast('Scan stored partially (storage full)');
+        st.scanning = false;
+        ov.remove();
+        rebuildModel(); render();
+        toast(out.diff ? `${out.diff.gained.length} new · ${out.diff.lost.length} removed since last scan` : 'Baseline captured — scan again later');
+      } catch (err) {
+        st.scanning = false; ov.remove();
+        if (cancelled || /cancelled/.test(String(err?.message))) toast('Scan cancelled — nothing saved');
+        else if (err instanceof RateLimit) toast('Rate-limited — nothing saved. Wait ~10–15 min.');
+        else toast(`Scan failed: ${err?.message || err}`);
+      }
+    };
+
+    return {
+      id: 'ledger', label: 'Ledger',
+      boot() { queue.register('unfollow', { run: (i) => api.unfollow(i.userId), onDone: (i) => afterUnfollow(i) }); },
+      mount(el) { container = el; rebuildModel(); render(); },
+      unmount() {},
+      onQueueChange() { rebuildModel(); refreshDynamic(); },
+    };
+  })();
+
+  // ##########################################################################
+  // MODULE: Followers — load any profile's followers, enrich, follow/unfollow
+  // (filled in stage 2)
+  // ##########################################################################
+  const followers = (() => {
+    const RESERVED = new Set(['explore', 'reels', 'reel', 'direct', 'stories', 'p', 'tv', 'accounts', 'about', 'developer', 'legal', 'directory', 'lite', 'session', 'graphql', 'api', 'your_activity', 'emails', 'challenge', 'privacy', 'web']);
+    const detectUsername = () => {
+      const m = location.pathname.match(/^\/([A-Za-z0-9._]{1,30})\/?$/);
+      return m && !RESERVED.has(m[1].toLowerCase()) ? m[1] : '';
+    };
+    const snapKey = (name) => `igs-fm-snap-${name.toLowerCase()}`;
+    const st = { profile: null, users: [], query: '', filter: 'all', scanning: false };
+    let container = null;
+
+    const loadSnapshot = (name) => {
+      const snap = store.get(snapKey(name), null);
+      if (snap) { st.profile = snap.profile; st.users = snap.users || []; return true; }
+      return false;
+    };
+    const persistSnapshot = () => {
+      if (st.profile) store.save(snapKey(st.profile.username), { profile: st.profile, users: st.users, ts: Date.now() });
+    };
+    const userById = (id) => st.users.find((u) => u.id === id);
+
+    // queue handlers mutate the loaded follower's relationship flag + persist
+    const onFollowDone = (item, requested) => { const u = userById(item.userId); if (u) { u.followedByViewer = !requested; u.requestedByViewer = !!requested; } persistSnapshot(); };
+    const onUnfollowDone = (item) => { const u = userById(item.userId); if (u) { u.followedByViewer = false; u.requestedByViewer = false; } persistSnapshot(); };
+
+    const FILTERS = [
+      ['all', 'All'], ['public', 'Public'], ['private', 'Private'], ['verified', 'Verified'],
+      ['following', 'You follow'], ['notfollowing', "You don't follow"],
+    ];
+    const matchFilter = (u) => {
+      switch (st.filter) {
+        case 'public': return !u.isPrivate;
+        case 'private': return u.isPrivate;
+        case 'verified': return u.isVerified;
+        case 'following': return u.followedByViewer === true;
+        case 'notfollowing': return u.followedByViewer === false;
+        default: return true;
+      }
+    };
+
+    const postThumb = (p) => `<a href="https://www.instagram.com/p/${esc(p.shortcode)}/" target="_blank" rel="noreferrer"><img loading="lazy" src="${esc(p.thumb)}" alt=""></a>`;
+    const hlChip = (h) => `<span>${esc(h.title || '•')}</span>`;
+    const enrichRow = (u) => {
+      if (!u.enriched) return '';
+      const e = u.enriched;
+      const posts = e.posts?.length ? `<div class="thumbs">${e.posts.map(postThumb).join('')}</div>` : '<div class="note" style="margin:0">no posts</div>';
+      const hls = e.highlights?.length ? `<div class="hl">${e.highlights.map(hlChip).join('')}</div>` : '';
+      return `<div class="note" style="margin:4px 0 0">${fmt(e.followerCount)} followers · ${fmt(e.followingCount)} following · ${fmt(e.mutualCount)} mutual</div>${posts}${hls}`;
+    };
+    const cardActions = (u) => {
+      const fStatus = queue.statusOf(u.id, 'fm-follow'), uStatus = queue.statusOf(u.id, 'fm-unfollow');
+      if (fStatus) return `<span class="qbadge ${fStatus}">${fStatus === 'done' ? 'followed ✓' : 'follow ' + fStatus}</span>`;
+      if (uStatus) return `<span class="qbadge ${uStatus}">${uStatus === 'done' ? 'unfollowed ✓' : 'unfollow ' + uStatus}</span>`;
+      let rel = '';
+      if (u.followedByViewer === true) rel = `<button class="actbtn" data-fmact="unfollow" data-uid="${esc(u.id)}">Unfollow</button>`;
+      else if (u.requestedByViewer === true) rel = '<span class="qbadge pending">requested</span>';
+      else rel = `<button class="actbtn plain" data-fmact="follow" data-uid="${esc(u.id)}">Follow</button>`;
+      const enrich = u.enriched ? '' : `<button class="actbtn plain" data-fmact="enrich" data-uid="${esc(u.id)}">Load details</button>`;
+      return rel + enrich;
+    };
+    const cardHTML = (u) => {
+      let badges = '';
+      if (u.isVerified) badges += badge('✓', 'v');
+      if (u.isPrivate) badges += badge('private');
+      if (u.followsViewer === true) badges += badge('follows you', 'blue');
+      const fn = u.fullName ? `<div class="fn">${esc(u.fullName)}</div>` : '';
+      return `<div class="card"><div class="chead">${avatar(u)}<div class="meta"><div class="u">${profileLink(u.username)}</div>${fn}</div>${badges}</div>` +
+        enrichRow(u) + `<div class="cact">${cardActions(u)}</div></div>`;
+    };
+
+    const cardsHTML = () => {
+      const q = st.query.toLowerCase();
+      const filtered = st.users.filter((u) => matchFilter(u) && (!q || u.username?.toLowerCase().includes(q) || u.fullName?.toLowerCase().includes(q)));
+      if (!st.users.length) return '<div class="empty">No followers loaded yet — hit Scan followers.</div>';
+      if (!filtered.length) return '<div class="empty">No matches.</div>';
+      const shown = filtered.slice(0, ROW_CAP);
+      const more = filtered.length > shown.length ? `<div class="more">Showing ${fmt(shown.length)} of ${fmt(filtered.length)} — search/filter to narrow.</div>` : '';
+      return `<div class="cards">${shown.map(cardHTML).join('')}</div>${more}`;
+    };
+    // re-render only the card grid (keeps search focus + page scroll)
+    const renderCards = () => { const host = $('[data-cards]', container); if (host) host.innerHTML = cardsHTML(); };
+    const onFilterClick = (e) => {
+      st.filter = e.currentTarget.dataset.filter;
+      $$('[data-filter]', container).forEach((x) => x.classList.toggle('on', x.dataset.filter === st.filter));
+      renderCards();
+    };
+
+    const render = () => {
+      const p = st.profile;
+      const detected = detectUsername();
+      const head = p
+        ? `<div class="kicker"><span class="accent">●</span> ${esc(p.username)} — ${fmt(p.followerCount)} followers · ${fmt(p.followingCount)} following</div>`
+        : '<div class="kicker"><span class="accent">●</span> Followers manager</div>';
+      let html = head +
+        '<div class="toolbar"><h3>Load a profile</h3>' +
+          `<input class="search" data-user placeholder="username (no @)" value="${esc(p?.username || detected || '')}">` +
+          '<button class="primary" data-load>Load profile</button>' +
+          (p ? '<button class="ghost" data-scan>Scan followers</button><button class="ghost" data-export>Export</button>' : '') +
+          (p ? `<span class="note" style="margin:0">${fmt(st.users.length)} loaded</span>` : '') + '</div>';
+      if (p) {
+        const chips = FILTERS.map(([k, lbl]) => `<button class="chip${st.filter === k ? ' on' : ''}" data-filter="${k}">${esc(lbl)}</button>`).join('');
+        html += `<div class="toolbar"><h3>Followers</h3><input class="search" data-search placeholder="Search…" value="${esc(st.query)}"></div>` +
+          `<div class="chips">${chips}</div><div data-cards>${cardsHTML()}</div>`;
+      } else {
+        html += '<div class="note">Open or type any profile, Load it, then Scan followers. Details (posts, highlights, mutuals) load per-card on demand.</div>';
+      }
+      container.innerHTML = html;
+      wire();
+    };
+
+    const wire = () => {
+      $('[data-load]', container).onclick = () => loadProfile($('[data-user]', container).value.trim());
+      const scanBtn = $('[data-scan]', container); if (scanBtn) scanBtn.onclick = () => runScan();
+      const expBtn = $('[data-export]', container); if (expBtn) expBtn.onclick = exportJSON;
+      const search = $('[data-search]', container); if (search) search.oninput = () => { st.query = search.value; renderCards(); };
+      $$('[data-filter]', container).forEach((b) => { b.onclick = onFilterClick; });
+      const host = $('[data-cards]', container);
+      if (host && !host._wired) {
+        host._wired = true;
+        host.addEventListener('click', (e) => { const b = e.target.closest?.('[data-fmact]'); if (b) cardAction(b.dataset.fmact, b.dataset.uid); });
+      }
+    };
+
+    const cardAction = (act, uidStr) => {
+      const u = userById(uidStr);
+      if (!u) return;
+      if (act === 'follow') queue.enqueue([{ kind: 'fm-follow', userId: u.id, username: u.username, fullName: u.fullName, isVerified: u.isVerified }]);
+      else if (act === 'unfollow') queue.enqueue([{ kind: 'fm-unfollow', userId: u.id, username: u.username, fullName: u.fullName, isVerified: u.isVerified }]);
+      else if (act === 'enrich') enrichUser(u);
+      renderCards();
+    };
+    const enrichUser = async (u) => {
+      if (u.enriched || u._enriching) return;
+      u._enriching = true;
+      try {
+        const [prof, hl] = await Promise.all([api.getWebProfile(u.username), api.getHighlights(u.id).catch(() => ({ count: 0, items: [] }))]);
+        u.enriched = { followerCount: prof.followerCount, followingCount: prof.followingCount, mutualCount: prof.mutualCount, postsCount: prof.postsCount, posts: prof.posts, highlights: hl.items, fetchedAt: Date.now() };
+        u.picUrl = u.picUrl || prof.picUrl;
+        persistSnapshot();
+        renderCards();
+      } catch (err) {
+        toast(err instanceof RateLimit ? 'Rate-limited — wait a bit' : `Couldn’t load @${u.username}`);
+      } finally { u._enriching = false; }
+    };
+
+    const loadProfile = async (name) => {
+      if (!name) return;
+      if (loadSnapshot(name)) render();
+      if (!api.loggedIn) { toast('Open instagram.com logged in to load live'); if (st.profile) { render(); } return; }
+      try {
+        const prof = await api.getWebProfile(name);
+        st.profile = { id: prof.id, username: prof.username, fullName: prof.fullName, picUrl: prof.picUrl, followerCount: prof.followerCount, followingCount: prof.followingCount, isPrivate: prof.isPrivate, isVerified: prof.isVerified };
+        persistSnapshot();
+        render();
+      } catch { toast(`Profile not found: @${name}`); }
+    };
+    const runScan = async () => {
+      if (st.scanning || !st.profile) return;
+      if (!api.loggedIn) { toast('Open instagram.com logged in to scan'); return; }
+      st.scanning = true;
+      let cancelled = false;
+      const ov = scanOverlay(`Loading @${st.profile.username} followers…`);
+      $('[data-cancel]', ov).onclick = () => { cancelled = true; $('[data-st]', ov).textContent = 'Cancelling…'; };
+      const total = st.profile.followerCount;
+      const progress = (kind, loaded) => {
+        const pct = Math.min(100, Math.round(loaded / Math.max(1, total) * 100));
+        $('[data-prog]', ov).style.width = `${pct}%`;
+        $('[data-pct]', ov).textContent = `${pct}%`;
+        $('[data-st]', ov).textContent = `Loaded ${fmt(loaded)} / ${fmt(total)}…`;
+      };
+      try {
+        const users = await scanList('followers', progress, st.profile.id, () => cancelled);
+        st.users = users;
+        persistSnapshot();
+        st.scanning = false; ov.remove(); render();
+        toast(`Loaded ${fmt(users.length)} followers of @${st.profile.username}`);
+      } catch (err) {
+        st.scanning = false; ov.remove();
+        if (cancelled || /cancelled/.test(String(err?.message))) toast('Scan cancelled');
+        else if (err instanceof RateLimit) toast('Rate-limited — wait ~10–15 min');
+        else toast(`Scan failed: ${err?.message || err}`);
+      }
+    };
+    const exportJSON = () => {
+      if (!st.profile) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), profile: st.profile, users: st.users }, null, 2)], { type: 'application/json' }));
+      a.download = `instagram-followers-${st.profile.username}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    };
+
+    return {
+      id: 'followers', label: 'Followers',
+      boot() {
+        queue.register('fm-follow', { run: async (i) => { const r = await api.follow(i.userId); return r?.friendship_status?.outgoing_request; }, onDone: (i, requested) => onFollowDone(i, requested) });
+        queue.register('fm-unfollow', { run: (i) => api.unfollow(i.userId), onDone: (i) => onUnfollowDone(i) });
+        const last = store.get('igs-fm-last', null);
+        if (last) loadSnapshot(last);
+      },
+      mount(el) { container = el; render(); },
+      unmount() { if (st.profile) store.save('igs-fm-last', st.profile.username); },
+      onQueueChange() { if (container) renderCards(); },
+    };
+  })();
+
+  // ##########################################################################
+  // MODULE: Pending — import data export, list & cancel pending requests
+  // (filled in stage 3)
+  // ##########################################################################
+  const pending = (() => {
+    const DKEY = 'igs-pending-data', RKEY = 'igs-pending-results', HKEY = 'igs-pending-history';
+    const HISTORY_LIMIT = 3000;
+    const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+    const st = { tab: 'requests', query: '', filter: 'all', selected: new Set(), msg: '' };
+    let data = null, results = {}, container = null, followingSet = new Set(), followersSet = new Set();
+
+    // ---- in-browser ZIP reader (stored + deflate-raw; no library) ----------
+    const ZIP = {
+      list(buf) {
+        const dv = new DataView(buf), len = buf.byteLength;
+        let eocd = -1;
+        for (let i = len - 22; i >= Math.max(0, len - 65557); i--) { if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; } }
+        if (eocd < 0) throw new Error('Not a valid .zip (no end-of-central-directory)');
+        const count = dv.getUint16(eocd + 10, true);
+        let off = dv.getUint32(eocd + 16, true);
+        const entries = [];
+        for (let n = 0; n < count; n++) {
+          if (dv.getUint32(off, true) !== 0x02014b50) break;
+          const method = dv.getUint16(off + 10, true), compSize = dv.getUint32(off + 20, true);
+          const nameLen = dv.getUint16(off + 28, true), extraLen = dv.getUint16(off + 30, true), commentLen = dv.getUint16(off + 32, true);
+          const localOff = dv.getUint32(off + 42, true);
+          const name = new TextDecoder().decode(new Uint8Array(buf, off + 46, nameLen));
+          entries.push({ name, method, compSize, localOff });
+          off += 46 + nameLen + extraLen + commentLen;
+        }
+        return entries;
+      },
+      async text(buf, entry) {
+        const dv = new DataView(buf);
+        if (dv.getUint32(entry.localOff, true) !== 0x04034b50) throw new Error('bad local header');
+        const nameLen = dv.getUint16(entry.localOff + 26, true), extraLen = dv.getUint16(entry.localOff + 28, true);
+        const start = entry.localOff + 30 + nameLen + extraLen;
+        const slice = new Uint8Array(buf, start, entry.compSize);
+        if (entry.method === 0) return new TextDecoder().decode(slice);
+        if (entry.method === 8) {
+          if (typeof DecompressionStream === 'undefined') throw new Error('This browser can’t unzip — extract the .zip and drop the .html/.json files instead.');
+          const stream = new Blob([slice]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+          return new TextDecoder().decode(await new Response(stream).arrayBuffer());
+        }
+        throw new Error(`unsupported zip method ${entry.method}`);
+      },
+    };
+
+    // ---- export parser -----------------------------------------------------
+    const classify = (filename) => {
+      const base = filename.split('/').pop().toLowerCase();
+      if (/^pending_follow_requests\.(html|json)$/.test(base)) return 'pending';
+      if (/^recent_follow_requests\.(html|json)$/.test(base)) return 'recent';
+      if (/^followers(_\d+)?\.(html|json)$/.test(base)) return 'followers';
+      if (/^following\.(html|json)$/.test(base)) return 'following';
+      if (/^recently_unfollowed_profiles\.(html|json)$/.test(base)) return 'unfollowed';
+      return null;
+    };
+    const parseExportDate = (text) => {
+      const m = text.match(/([a-z]{3,9})\s+(\d{1,2}),\s+(\d{4})(?:\s+(\d{1,2}):(\d{2}) ?(am|pm)?)?/i);
+      if (!m) return null;
+      const mon = MONTHS[m[1].slice(0, 3).toLowerCase()];
+      if (mon == null) return null;
+      let hr = m[4] ? Number(m[4]) : 0;
+      if (m[6]?.toLowerCase() === 'pm' && hr < 12) hr += 12;
+      if (m[6]?.toLowerCase() === 'am' && hr === 12) hr = 0;
+      return new Date(Number(m[3]), mon, Number(m[2]), hr, m[5] ? Number(m[5]) : 0).getTime();
+    };
+    const linkUsername = (box) => {
+      const href = box.querySelector('a[href*="instagram.com"]')?.getAttribute('href');
+      const m = href?.match(/instagram\.com\/(?:_u\/)?([^#?/]+)/);
+      return m ? decodeURIComponent(m[1]) : '';
+    };
+    const parseBox = (box) => {
+      let username = '', fullName = '';
+      for (const tr of box.querySelectorAll('table tr')) {
+        const tds = tr.querySelectorAll('td');
+        if (tds.length < 2) continue;
+        const label = tds[0].textContent.trim().toLowerCase(), val = tds[1].textContent.trim();
+        if (label === 'username') username = val;
+        else if (label === 'name') fullName = val;
+      }
+      if (!username) username = linkUsername(box);
+      if (!username) return null;
+      const dateEl = box.querySelector('._a6-o') || [...box.querySelectorAll('div._a6-p div div')].pop();
+      const dateText = dateEl?.textContent.trim() || '';
+      return { username, fullName, timestamp: parseExportDate(dateText), dateText };
+    };
+    const parseHtml = (text) => {
+      const doc = new DOMParser().parseFromString(text, 'text/html');
+      const main = doc.querySelector('main') || doc.body;
+      const out = [];
+      for (const box of [...main.children]) { const e = parseBox(box); if (e) out.push(e); }
+      return out;
+    };
+    const parseJson = (text) => {
+      const rootObj = JSON.parse(text);
+      let list = Array.isArray(rootObj) ? rootObj : Object.values(rootObj).find((v) => Array.isArray(v));
+      if (!Array.isArray(list)) return [];
+      return list.map((item) => {
+        const sld = item.string_list_data?.[0] || {};
+        return { username: sld.value || '', fullName: item.title && item.title !== sld.value ? item.title : '', timestamp: sld.timestamp ? sld.timestamp * 1000 : null, dateText: '' };
+      }).filter((r) => r.username);
+    };
+    const parseText = (name, text) => (/\.json$/i.test(name) ? parseJson(text) : parseHtml(text));
+    const dedupePending = (entries) => {
+      const map = new Map();
+      for (const e of entries) { const ex = map.get(e.username); if (!ex || (e.timestamp || 0) > (ex.timestamp || 0)) map.set(e.username, e); }
+      return [...map.values()].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    };
+
+    const ingestZip = async (file, buckets) => {
+      const buf = await file.arrayBuffer();
+      let generatedBy = '', found = false;
+      for (const e of ZIP.list(buf).filter((x) => /followers_and_following\//.test(x.name) && classify(x.name))) {
+        const text = await ZIP.text(buf, e);
+        if (!generatedBy) generatedBy = text.match(/Generated by (\S+) on/)?.[1] || '';
+        buckets[classify(e.name)].push(...parseText(e.name, text));
+        found = true;
+      }
+      if (!generatedBy) generatedBy = file.name.match(/^instagram-([^-]+)-/)?.[1] || '';
+      return { generatedBy, found };
+    };
+    const buildData = (buckets, generatedBy) => {
+      const requests = dedupePending(buckets.pending);
+      if (!requests.length) throw new Error('No pending follow requests found in that export.');
+      const followers = [...new Set(buckets.followers.map((e) => e.username))];
+      const following = [...new Set(buckets.following.map((e) => e.username))];
+      return { generatedBy, importedAt: Date.now(), requests, followers, following, counts: { pending: requests.length, recent: buckets.recent.length, followers: followers.length, following: following.length, unfollowed: buckets.unfollowed.length } };
+    };
+    const importFiles = async (files) => {
+      const buckets = { pending: [], recent: [], followers: [], following: [], unfollowed: [] };
+      let generatedBy = '', recognized = false;
+      for (const file of files) {
+        if (/\.zip$/i.test(file.name)) {
+          const z = await ingestZip(file, buckets);
+          if (z.generatedBy && !generatedBy) generatedBy = z.generatedBy;
+          if (z.found) recognized = true;
+        } else {
+          const kind = classify(file.name);
+          if (!kind) continue;
+          buckets[kind].push(...parseText(file.name, await file.text()));
+          recognized = true;
+        }
+      }
+      if (!recognized) throw new Error('No recognizable files. Drop the export .zip, or pending_follow_requests.html / followers_*.html / following.html.');
+      data = buildData(buckets, generatedBy);
+      store.save(DKEY, data);
+      rebuildSets();
+    };
+    const rebuildSets = () => { followingSet = new Set(data?.following || []); followersSet = new Set(data?.followers || []); };
+
+    // ---- results + history -------------------------------------------------
+    const setResult = (username, res) => {
+      results[username] = { status: res.status, at: Date.now(), detail: res.detail, userId: res.id };
+      store.save(RKEY, results);
+      let hist = store.get(HKEY, []);
+      hist.push({ time: Date.now(), username, action: res.status, detail: res.detail || '' });
+      if (hist.length > HISTORY_LIMIT) hist = hist.slice(-HISTORY_LIMIT);
+      store.save(HKEY, hist);
+    };
+
+    // ---- queue handlers (resolve username→id at run time) ------------------
+    const resolve = async (username) => {
+      const prof = await api.getWebProfile(username);
+      let outgoing = prof.requestedByViewer, following = prof.followedByViewer;
+      if (outgoing == null) { const fs = await api.getFriendship(prof.id); outgoing = fs.outgoingRequest; following = fs.following; }
+      return { id: prof.id, outgoing, following };
+    };
+    const runVerify = async (item) => {
+      const r = await resolve(item.username);
+      if (r.outgoing) return { id: r.id, status: 'verified-pending', detail: 'still pending' };
+      return { id: r.id, status: 'not-pending', detail: r.following ? 'accepted — you follow them' : 'no outgoing request (cancelled/declined)' };
+    };
+    const runCancel = async (item) => {
+      const r = await resolve(item.username);
+      if (!r.outgoing) return { id: r.id, status: 'not-pending', detail: r.following ? 'already accepted' : 'no outgoing request' };
+      await api.unfollow(r.id);
+      return { id: r.id, status: 'cancelled', detail: 'request cancelled' };
+    };
+
+    // ---- rendering ---------------------------------------------------------
+    const STATUS = { cancelled: ['cancelled', 'done'], 'not-pending': ['not pending', 'pending'], 'verified-pending': ['still pending', 'failed'], 'not-found': ['not found', 'pending'], failed: ['failed', 'failed'] };
+    const rowStatus = (username) => {
+      const qs = queue.statusOf(username, 'cancel') || queue.statusOf(username, 'verify');
+      if (qs === 'pending' || qs === 'running' || qs === 'done') return { queued: qs };
+      const r = results[username];
+      return r ? { result: r.status, detail: r.detail } : {};
+    };
+    const FILTERS = [['all', 'All'], ['unprocessed', 'Unprocessed'], ['queued', 'Queued'], ['cancelled', 'Cancelled'], ['verified-pending', 'Still pending'], ['not-pending', 'Gone/accepted'], ['failed', 'Failed']];
+    const matchFilter = (req) => {
+      if (st.filter === 'all') return true;
+      const s = rowStatus(req.username);
+      if (st.filter === 'queued') return !!s.queued;
+      if (st.filter === 'unprocessed') return !s.queued && !s.result;
+      return s.result === st.filter;
+    };
+    const filteredRequests = () => {
+      const q = st.query.toLowerCase();
+      return (data?.requests || []).filter((r) => matchFilter(r) && (!q || r.username.toLowerCase().includes(q) || r.fullName?.toLowerCase().includes(q)));
+    };
+    const statusChip = (s) => {
+      if (s.queued) return `<span class="qbadge ${s.queued}">${s.queued === 'done' ? 'done ✓' : s.queued}</span>`;
+      if (!s.result) return '';
+      const [lbl, cls] = STATUS[s.result] || [s.result, 'pending'];
+      return `<span class="qbadge ${cls}" title="${esc(s.detail || '')}">${esc(lbl)}</span>`;
+    };
+    const reqBadges = (req) => {
+      let b = '';
+      if (followingSet.has(req.username)) b += badge('in following', 'ok');
+      if (followersSet.has(req.username)) b += badge('follows you', 'blue');
+      return b;
+    };
+    const reqWhen = (req) => {
+      if (req.timestamp) return `<span class="when">${fmtAgo(req.timestamp)}</span>`;
+      if (req.dateText) return `<span class="when">${esc(req.dateText)}</span>`;
+      return '';
+    };
+    const reqCheckbox = (req, done) => {
+      if (done) return '<span style="min-width:44px;flex:none"></span>';
+      const checked = st.selected.has(req.username) ? ' checked' : '';
+      return `<label class="ckwrap"><input type="checkbox" class="ck" data-u="${esc(req.username)}"${checked}></label>`;
+    };
+    const reqActions = (req, s, done) => {
+      if (s.queued === 'pending' || s.queued === 'running') return `<button class="actbtn plain" data-pact="unqueue" data-u="${esc(req.username)}">Unqueue</button>`;
+      if (!done && api.loggedIn) return `<button class="actbtn plain" data-pact="verify" data-u="${esc(req.username)}">Verify</button><button class="actbtn" data-pact="cancel" data-u="${esc(req.username)}">Cancel</button>`;
+      return '';
+    };
+    const reqRow = (req) => {
+      const s = rowStatus(req.username);
+      const done = !!s.result || s.queued === 'done';
+      const fn = req.fullName ? `<div class="fn">${esc(req.fullName)}</div>` : '';
+      return `<div class="row${done ? ' q-done' : ''}">${reqCheckbox(req, done)}` +
+        `<div class="av">${esc(req.username.charAt(0).toUpperCase())}</div>` +
+        `<div class="meta"><div class="u">${profileLink(req.username)}</div>${fn}</div>` +
+        `${reqBadges(req)}${reqWhen(req)}${statusChip(s)}${reqActions(req, s, done)}</div>`;
+    };
+    const histRow = (h) => {
+      const detail = h.detail ? ` · ${esc(h.detail)}` : '';
+      return `<div class="row"><div class="meta"><div class="u">${profileLink(h.username)}</div><div class="fn">${esc(h.action)}${detail}</div></div><span class="when">${fmtAgo(h.time)}</span></div>`;
+    };
+
+    const dropzone = () =>
+      '<div class="kicker"><span class="accent">●</span> Import your data export</div>' +
+      '<div class="drop" data-drop>Drop your Instagram export <b>.zip</b> here, or click to choose files<br><span style="font-size:11px">also accepts loose pending_follow_requests.html/.json, followers_*.html, following.html</span></div>' +
+      '<input type="file" accept=".zip,.html,.json" multiple data-file style="display:none">' +
+      (st.msg ? `<div class="warn">${esc(st.msg)}</div>` : '') +
+      '<div class="note">Instagram → Settings → Accounts Center → Your information &amp; permissions → Download your information → “Followers and following”. HTML or JSON both work. Nothing is uploaded.</div>';
+
+    const statCards = () => {
+      const counts = { queued: 0, cancelled: 0, gone: 0, failed: 0 };
+      for (const r of data.requests) {
+        const s = rowStatus(r.username);
+        if (s.queued === 'pending' || s.queued === 'running') counts.queued += 1;
+        else if (s.result === 'cancelled') counts.cancelled += 1;
+        else if (s.result === 'not-pending' || s.result === 'not-found') counts.gone += 1;
+        else if (s.result === 'failed') counts.failed += 1;
+      }
+      const card = (v, l) => `<div class="metric"><div class="v">${v}</div><div class="l">${l}</div></div>`;
+      return `<div class="metrics" data-stats>${card(fmt(data.requests.length), 'Imported')}${card(fmt(counts.queued), 'Queued')}${card(fmt(counts.cancelled), 'Cancelled')}${card(fmt(counts.gone), 'Gone/accepted')}${card(fmt(counts.failed), 'Failed')}${card(esc(data.generatedBy || '—'), 'From')}</div>`;
+    };
+    const subnav = () => {
+      const tabs = [['requests', `Requests (${fmt(data.counts.pending)})`], ['activity', 'Activity'], ['import', 'Import']];
+      const btns = tabs.map(([k, lbl]) => `<button class="tab${st.tab === k ? ' on' : ''}" data-ptab="${k}">${esc(lbl)}</button>`).join('');
+      return `<div class="tabs">${btns}</div>`;
+    };
+
+    const renderImport = () =>
+      subnav() + `<div class="note">${fmt(data.counts.pending)} pending · ${fmt(data.counts.followers)} followers · ${fmt(data.counts.following)} following imported.</div>` +
+      '<button class="danger" data-pact="wipe">Delete imported data &amp; results</button>' + dropzone();
+    const renderActivity = () => {
+      const hist = store.get(HKEY, []).slice().reverse().slice(0, 400);
+      const rows = hist.length ? hist.map(histRow).join('') : '<div class="empty">No actions yet.</div>';
+      return subnav() + '<div class="toolbar"><h3>Activity</h3><button class="ghost" data-pact="export">Export results JSON</button></div>' + `<div class="rows">${rows}</div>`;
+    };
+    const renderRequests = () => {
+      const reqs = filteredRequests();
+      const chips = FILTERS.map(([k, lbl]) => `<button class="chip${st.filter === k ? ' on' : ''}" data-pfilter="${k}">${esc(lbl)}</button>`).join('');
+      const warn = api.loggedIn ? '' : '<div class="warn">Not logged in on instagram.com — browse/filter works, but Verify/Cancel are disabled. Open instagram.com and re-run to act.</div>';
+      const shown = reqs.slice(0, ROW_CAP);
+      const rows = shown.length ? shown.map(reqRow).join('') : '<div class="empty">No requests match.</div>';
+      const more = reqs.length > shown.length ? `<div class="more">Showing ${fmt(shown.length)} of ${fmt(reqs.length)} — search/filter to narrow.</div>` : '';
+      const bulkOff = st.selected.size && api.loggedIn ? '' : ' disabled';
+      return subnav() + warn + statCards() +
+        `<div class="seltool"><button class="ghost" data-pact="selall">Select all (${fmt(reqs.length)})</button><button class="ghost" data-pact="selnone">Clear</button>` +
+          `<span class="sc"><b data-selc>${fmt(st.selected.size)}</b> selected</span><span class="sp"></span>` +
+          `<button class="ghost" data-pact="verifysel"${bulkOff}>Verify selected</button>` +
+          `<button class="primary" data-pact="cancelsel"${bulkOff}>Cancel selected →</button></div>` +
+        `<div class="toolbar"><input class="search" data-search placeholder="Search username or name…" value="${esc(st.query)}">` +
+          `<button class="danger" data-pact="cancelall"${api.loggedIn ? '' : ' disabled'}>Cancel ALL pending</button></div>` +
+        `<div class="chips">${chips}</div><div data-rows>${rows}${more}</div>`;
+    };
+    const render = () => {
+      if (!data) container.innerHTML = dropzone();
+      else if (st.tab === 'import') container.innerHTML = renderImport();
+      else if (st.tab === 'activity') container.innerHTML = renderActivity();
+      else container.innerHTML = renderRequests();
+      wire();
+    };
+    const refreshRows = () => { const host = $('[data-rows]', container); if (host) host.innerHTML = filteredRequests().slice(0, ROW_CAP).map(reqRow).join('') || '<div class="empty">No requests match.</div>'; };
+    const updateSelCount = () => { const c = $('[data-selc]', container); if (c) c.textContent = fmt(st.selected.size); };
+    const enqueueReqs = (usernames, kind) => queue.enqueue(usernames.map((u) => ({ kind, userId: u, username: u })));
+
+    const handleFiles = async (files) => {
+      if (!files.length) return;
+      st.msg = 'Reading…'; render();
+      try { await importFiles(files); st.tab = 'requests'; st.msg = ''; render(); toast(`Imported ${fmt(data.requests.length)} pending requests`); }
+      catch (err) { st.msg = String(err?.message || err); render(); }
+    };
+    const cancelAll = () => {
+      const all = (data.requests || []).filter((r) => !results[r.username] && !queue.statusOf(r.username, 'cancel')).map((r) => r.username);
+      if (!all.length) return;
+      const sp = queue.speed(), mins = Math.max(1, Math.round(all.length * ((sp.min + sp.max) / 2) / 60000));
+      if (confirm(`Cancel ALL ${all.length} pending request(s)? One at a time (${sp.label}), ~${mins} min.`)) enqueueReqs(all, 'cancel');
+    };
+    const exportResults = () => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), results, history: store.get(HKEY, []) }, null, 2)], { type: 'application/json' }));
+      a.download = `instagram-pending-results-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    };
+    const wipeData = () => {
+      if (!confirm('Delete all imported export data and results?')) return;
+      for (const k of [DKEY, RKEY, HKEY]) store.remove(k);
+      data = null; results = {}; rebuildSets(); st.selected.clear();
+    };
+    const unqueueOne = (username) => { const it = queue.items.find((i) => i.username === username && (i.kind === 'cancel' || i.kind === 'verify')); if (it) queue.removeItem(it.id); };
+    const cancelSelected = () => { if (confirm(`Cancel ${st.selected.size} request(s)?`)) { enqueueReqs([...st.selected], 'cancel'); st.selected.clear(); } };
+    const pActions = {
+      verify: (u) => enqueueReqs([u], 'verify'),
+      cancel: (u) => enqueueReqs([u], 'cancel'),
+      unqueue: (u) => unqueueOne(u),
+      selall: () => { for (const r of filteredRequests()) st.selected.add(r.username); },
+      selnone: () => st.selected.clear(),
+      verifysel: () => { enqueueReqs([...st.selected], 'verify'); st.selected.clear(); },
+      cancelsel: () => cancelSelected(),
+      cancelall: () => cancelAll(),
+      export: () => exportResults(),
+      wipe: () => wipeData(),
+    };
+    const pAction = (act, username) => { pActions[act]?.(username); render(); };
+
+    // ---- event handlers (module-scope to avoid deep nesting) ---------------
+    const onPtabClick = (e) => { st.tab = e.currentTarget.dataset.ptab; render(); };
+    const onPfilterClick = (e) => { st.filter = e.currentTarget.dataset.pfilter; render(); };
+    const onPactClick = (e) => pAction(e.currentTarget.dataset.pact, e.currentTarget.dataset.u);
+    const onSearchInput = (e) => { st.query = e.currentTarget.value; refreshRows(); };
+    const onDragOver = (e) => { e.preventDefault(); e.currentTarget.classList.add('over'); };
+    const onDragLeave = (e) => e.currentTarget.classList.remove('over');
+    const onDrop = (e) => { e.preventDefault(); e.currentTarget.classList.remove('over'); handleFiles([...e.dataTransfer.files]); };
+    const onRowsChange = (e) => { const t = e.target; if (!t.classList?.contains('ck')) { return; } if (t.checked) { st.selected.add(t.dataset.u); } else { st.selected.delete(t.dataset.u); } updateSelCount(); };
+    const onRowsClick = (e) => { const b = e.target.closest?.('[data-pact]'); if (b) pAction(b.dataset.pact, b.dataset.u); };
+    const wire = () => {
+      $$('[data-ptab]', container).forEach((b) => { b.onclick = onPtabClick; });
+      $$('[data-pfilter]', container).forEach((b) => { b.onclick = onPfilterClick; });
+      const search = $('[data-search]', container); if (search) search.oninput = onSearchInput;
+      const file = $('[data-file]', container), drop = $('[data-drop]', container);
+      if (drop && file) {
+        drop.onclick = () => file.click();
+        drop.ondragover = onDragOver; drop.ondragleave = onDragLeave; drop.ondrop = onDrop;
+        file.onchange = () => handleFiles([...file.files]);
+      }
+      // toolbar buttons bound directly; per-row buttons use delegation (below)
+      $$('[data-pact]', container).forEach((b) => { if (!b.closest('[data-rows]')) b.onclick = onPactClick; });
+      const rows = $('[data-rows]', container);
+      if (rows && !rows._wired) { rows._wired = true; rows.addEventListener('change', onRowsChange); rows.addEventListener('click', onRowsClick); }
+    };
+
+    return {
+      id: 'pending', label: 'Pending',
+      boot() {
+        queue.register('verify', { run: runVerify, onDone: (i, res) => setResult(i.username, res), onFail: (i, err) => setResult(i.username, { status: err instanceof ApiError && err.status === 404 ? 'not-found' : 'failed', detail: String(err?.message || err) }) });
+        queue.register('cancel', { run: runCancel, onDone: (i, res) => setResult(i.username, res), onFail: (i, err) => setResult(i.username, { status: err instanceof ApiError && err.status === 404 ? 'not-found' : 'failed', detail: String(err?.message || err) }) });
+        data = store.get(DKEY, null); results = store.get(RKEY, {}); rebuildSets();
+      },
+      mount(el) { container = el; render(); },
+      unmount() {},
+      onQueueChange() { if (container && data && st.tab === 'requests') render(); },
+    };
+  })();
+
+  // ==========================================================================
+  // Self-test (ponytail: one runnable check on shared diff/queue logic)
+  // ==========================================================================
+  globalThis.__igsSelfTest = () => {
+    const U = (id) => ({ id: String(id), username: `u${id}`, fullName: '', isVerified: false, isPrivate: false });
+    const not = (l, o) => (l || []).filter((u) => !o[u.id]);
+    const prevF = [U(1), U(2), U(3)], currF = [U(2), U(3), U(4)];
+    const gained = not(currF, byId(prevF)), lost = not(prevF, byId(currF));
+    console.assert(gained.map((u) => u.id).join() === '4', 'gained [4]');
+    console.assert(lost.map((u) => u.id).join() === '1', 'lost [1]');
+    const backoff = [1, 2, 3, 4, 5].map((att) => Math.min(16, 2 ** (att - 1)));
+    console.assert(backoff.join() === '1,2,4,8,16', 'backoff 1,2,4,8,16');
+    console.assert(esc(`<a>&"'`) === '&lt;a&gt;&amp;&quot;&#39;', 'esc');
+    console.log('%c__igsSelfTest passed', 'color:#e4002b;font-weight:700');
+    return true;
+  };
+
+  // ==========================================================================
+  // Boot
+  // ==========================================================================
+  if (location.hostname !== HOST && location.hostname !== 'instagram.com') {
+    // still usable for the Pending importer; warn but continue
+    console.warn('[Instagram Suite] Not on instagram.com — scans/actions disabled; the Pending importer still works.');
+  }
+  const styleEl = document.createElement('style');
+  styleEl.id = 'igs-style';
+  styleEl.textContent = CSS;
+  document.head.appendChild(styleEl);
+  root = document.createElement('div');
+  root.id = 'igs-root';
+  document.body.appendChild(root);
+
+  modules.push(ledger, followers, pending);
+  modules.forEach((m) => m.boot?.());
+  queue.load();
+  renderShell();
+  mountModule('ledger');
+  renderQueuePanel();
+  // control handle (mirrors the originals' window.IGFM / window.IGPR)
+  globalThis.IGS = { version: '1.0.0', mount: mountModule, close: teardown, queue };
+  if (queue.items.some((i) => i.status === 'pending' || i.status === 'running')) queue.start();
+  try { globalThis.__igsSelfTest(); } catch { /* non-fatal */ }
+})();
