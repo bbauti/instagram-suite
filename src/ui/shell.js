@@ -6,6 +6,7 @@
 // `onChange`/`onTick` hooks are wired here so the panel redraws as actions run.
 import { html, render, nothing } from 'lit-html';
 import { app } from '../core/state.js';
+import { store } from '../core/store.js';
 import { $, $$, fmt, fmtCountdown } from '../core/utils.js';
 import { api } from '../core/api.js';
 import { queue, SPEEDS, KIND_VERB } from '../core/queue.js';
@@ -17,6 +18,7 @@ export const setModules = (mods) => { modules = mods; };
 export const mountModule = (id) => {
   const mod = modules.find((entry) => entry.id === id);
   if (!mod || app.active?.id === id) return;
+  if (mod.requiresLogin && !api.loggedIn) return; // API-only tool, disabled off instagram
 
   app.active?.unmount?.();
   app.active = mod;
@@ -28,7 +30,11 @@ export const mountModule = (id) => {
 // ── shell chrome ──────────────────────────────────────────────────────────────
 // Chrome is rendered once; the nav `.on` class is toggled imperatively by
 // mountModule (no need to re-render the whole shell to flip one class).
-const navTpl = () => html`<div class="nav">${modules.map((mod) => html`<button data-mod=${mod.id} @click=${() => mountModule(mod.id)}>${mod.label}</button>`)}</div>`;
+// Tools that need the live IG API (Ledger, Followers) are disabled off instagram.
+const navTpl = () => html`<div class="nav">${modules.map((mod) => {
+  const locked = mod.requiresLogin && !api.loggedIn;
+  return html`<button data-mod=${mod.id} ?disabled=${locked} title=${locked ? 'Open instagram.com logged in to use this' : nothing} @click=${() => mountModule(mod.id)}>${mod.label}</button>`;
+})}</div>`;
 
 const whoTpl = () => html`<div class="who">viewer #${api.viewerId || '—'}${api.loggedIn ? nothing : html`<br>⚠ not on instagram.com`}</div>`;
 
@@ -42,6 +48,7 @@ export const renderShell = () => {
         ${whoTpl()}
         <button class="iconbtn" title="Close" @click=${() => teardown()}>✕</button>
       </div>
+      ${store.usable ? nothing : html`<div class="warn">⚠ This page is sandboxed — browser storage is blocked, so nothing here is saved (imports, snapshots and the action queue vanish on reload). Open <b>instagram.com</b> directly for the full suite.</div>`}
       <div id="igs-view"></div>
     </div>
   `, app.root);

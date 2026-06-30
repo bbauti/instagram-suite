@@ -46,8 +46,11 @@ main.js            entry: teardown, inject CSS, boot tools, render shell, expose
 
 ## The tool contract
 
-Each tool is an object: `{ id, label, boot(), mount(el), unmount(), onQueueChange() }`.
+Each tool is an object: `{ id, label, requiresLogin?, boot(), mount(el), unmount(), onQueueChange() }`.
 
+- `requiresLogin` (optional) — `true` if the tool needs the live IG API (Ledger, Followers).
+  Off instagram (`!api.loggedIn`) the shell disables its nav button and won't mount it; `main.js`
+  opens the first usable tool (Pending off-host). Pending omits it.
 - `boot()` — register queue handlers and load persisted state (called once at startup).
 - `mount(el)` — render the tool's UI into the given container (sets `container`, calls `update()`).
 - `unmount()` — tear down (the shell calls this on the outgoing tool before swapping).
@@ -59,7 +62,7 @@ sets `app.active`, calls the old tool's `unmount()` and the new tool's `mount(ap
 
 ### Add a new tool
 
-1. Create `src/tools/x.js` exporting `export const x = { id, label, boot, mount, unmount, onQueueChange }`.
+1. Create `src/tools/x.js` exporting `export const x = { id, label, requiresLogin?, boot, mount, unmount, onQueueChange }`.
 2. In `src/main.js`, `import { x } from './tools/x.js'` and add `x` to the `modules` array.
 3. The shell auto-builds the top-nav from the modules list. Rebuild and re-paste.
 

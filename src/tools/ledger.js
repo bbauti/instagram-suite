@@ -396,6 +396,7 @@ export const ledger = (() => {
   return {
     id: 'ledger',
     label: 'Ledger',
+    requiresLogin: true, // needs the live IG API (scans your own followers/following)
     boot() {
       queue.register('unfollow', { run: (item) => api.unfollow(item.userId), onDone: (item) => afterUnfollow(item) });
     },

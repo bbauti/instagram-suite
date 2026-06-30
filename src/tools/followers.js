@@ -278,7 +278,7 @@ export const followers = (() => {
 
   // ── lifecycle ──
   return {
-    id: 'followers', label: 'Followers',
+    id: 'followers', label: 'Followers', requiresLogin: true, // needs the live IG API
     boot() {
       queue.register('fm-follow', {
         run: async (item) => {

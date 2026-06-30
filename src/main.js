@@ -3,6 +3,7 @@
 // stylesheet, boots the three tools through the shared queue, renders the shell
 // and exposes the `IGS` console handle.
 import { HOST } from './core/constants.js';
+import { api } from './core/api.js';
 import { queue } from './core/queue.js';
 import { app } from './core/state.js';
 import { CSS } from './ui/css.js';
@@ -41,7 +42,9 @@ queue.load();
 
 // ── render the shell and open the first tool ──
 renderShell();
-mountModule('ledger');
+// open the first tool usable here — Ledger/Followers need login; off instagram that's Pending
+const firstTool = modules.find((m) => !m.requiresLogin || api.loggedIn) || modules[0];
+mountModule(firstTool.id);
 renderQueuePanel();
 
 // ── expose the console handle ──

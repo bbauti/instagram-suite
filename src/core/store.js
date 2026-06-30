@@ -1,6 +1,21 @@
 // localStorage layer. Degrades to compact records on quota.
 // ~5MB ceiling. Move to IndexedDB only if a very large account overflows.
+
+// One-time probe: localStorage throws on sandboxed documents (no allow-same-origin
+// flag), where nothing can be persisted. `store.usable` lets the UI warn about it.
+const storageUsable = (() => {
+  try {
+    localStorage.setItem('__igs_probe__', '1');
+    localStorage.removeItem('__igs_probe__');
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
 export const store = {
+  usable: storageUsable,
+
   get(key, fallback) {
     try {
       const stored = localStorage.getItem(key);

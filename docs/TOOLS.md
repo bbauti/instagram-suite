@@ -4,7 +4,7 @@ Instagram Suite bundles three tools over one shared core (the global action queu
 client, the store, and the SPA shell). The nav at the top of the overlay switches between them;
 `globalThis.IGS.mount('ledger' | 'followers' | 'pending')` jumps straight to one.
 
-Every tool is the same object contract — `{ id, label, boot(), mount(el), unmount(), onQueueChange() }`
+Every tool is the same object contract — `{ id, label, requiresLogin?, boot(), mount(el), unmount(), onQueueChange() }`
 — defined in its file under `src/tools/`. `boot()` registers the tool's queue handlers and loads
 persisted state; `mount(el)` renders into the container the shell gives it (via lit-html);
 `onQueueChange()` is called by the shell whenever queue state changes so the tool can re-render

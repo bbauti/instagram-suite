@@ -3,8 +3,14 @@ export const $ = (sel, scope) => (scope || document).querySelector(sel);
 export const $$ = (sel, scope) => [...(scope || document).querySelectorAll(sel)];
 
 export const getCookie = (name) => {
-  const parts = `; ${document.cookie}`.split(`; ${name}=`);
-  return parts.length === 2 ? parts.pop().split(';').shift() : null;
+  try {
+    const parts = `; ${document.cookie}`.split(`; ${name}=`);
+    return parts.length === 2 ? parts.pop().split(';').shift() : null;
+  } catch {
+    // Sandboxed document (no allow-same-origin flag) throws on document.cookie —
+    // treat as logged-out so the suite still boots (off-host / Pending importer).
+    return null;
+  }
 };
 
 export const esc = (s) => String(s ?? '')

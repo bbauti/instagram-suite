@@ -132,11 +132,13 @@ test strategy.
 A tool is a plain object implementing the **tool contract**:
 
 ```
-{ id, label, boot(), mount(el), unmount(), onQueueChange() }
+{ id, label, requiresLogin?, boot(), mount(el), unmount(), onQueueChange() }
 ```
 
 - `id` — unique string, also the `mount('<id>')` key and the nav `data-mod` value.
 - `label` — text shown in the top nav.
+- `requiresLogin` (optional) — set `true` if the tool needs the live IG API. Off instagram its
+  nav button is disabled and it won't mount; the shell opens the first tool without the flag.
 - `boot()` — called once at startup. Register your queue handlers and load persisted state
   here. Don't render.
 - `mount(el)` — render your UI into the given container element (`app.view`).
@@ -293,11 +295,14 @@ Match the existing style — **do not propose rewrites**:
 
 ## Troubleshooting
 
-- **Not on `instagram.com` → scans/actions disabled.** `api.loggedIn` is false off-host, so
-  main logs a warning and the shell shows "⚠ not on instagram.com". Ledger/Followers can't
-  hit the API, but the **Pending importer still works** — it browses entirely from your
-  imported data export with zero API calls. (Verify/Cancel in Pending still need a logged-in
-  session.)
+- **Not on `instagram.com` → Ledger/Followers disabled.** `api.loggedIn` is false off-host, so
+  the shell **disables the Ledger and Followers nav buttons** (they need the live API) and opens
+  **Pending** by default — it browses entirely from your imported data export with zero API
+  calls. (Verify/Cancel in Pending still need a logged-in session.) On a **sandboxed document**
+  (no `allow-same-origin` flag) `document.cookie` throws a `SecurityError`; `getCookie` catches it
+  and returns `null`, so the suite still boots instead of crashing — and since `localStorage` is
+  also blocked there (`store.usable` is false), the shell shows a banner that nothing will be
+  saved (Pending can browse but can't persist).
 
 - **Rate-limited → queue auto-pauses ~10 minutes.** When `run` throws a `RateLimit` (HTTP
   429, `feedback_required`, spam/checkpoint signals, or a `RATE_LIMIT_RE` match), the queue

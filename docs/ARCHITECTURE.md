@@ -136,7 +136,9 @@ panel, and teardown. It holds a private `modules` array, seeded by `main.js`:
 - **`renderShell()`** — builds the overlay markup into `app.root`: brand, a nav button per
   module (`data-mod="<id>"`), a viewer badge (`api.viewerId`, with a warning if not on
   `instagram.com`), and the empty `#igs-view` container. It then caches
-  `app.view = #igs-view` and wires the close button and nav clicks.
+  `app.view = #igs-view` and wires the close button and nav clicks. Nav buttons for
+  `requiresLogin` tools are disabled when `!api.loggedIn`, and a sandboxed-storage warning
+  banner appears when `store.usable` is false.
 - **`mountModule(id)`** — the SPA router. It finds the module, no-ops if it's already
   active, calls the previous tool's `unmount?.()`, sets `app.active`, toggles the nav
   `.on` class, clears `app.view`, and calls the new tool's `mount(app.view)`.
@@ -163,11 +165,15 @@ Every tool is a plain object with this shape (see `tools/ledger.js`, `tools/foll
 `tools/pending.js`):
 
 ```js
-{ id, label, boot(), mount(el), unmount(), onQueueChange() }
+{ id, label, requiresLogin?, boot(), mount(el), unmount(), onQueueChange() }
 ```
 
 - **`id` / `label`** — stable id (used by `mountModule` and the nav `data-mod`) and the
   human nav label.
+- **`requiresLogin`** (optional) — `true` for tools that need the live IG API (Ledger,
+  Followers). Off instagram (`!api.loggedIn`) the shell disables their nav button and
+  `mountModule` refuses to mount them; `main.js` opens the first usable tool instead (Pending,
+  which works from an imported export). Pending omits the flag.
 - **`boot()`** — called once by `main.js` for every tool at startup, *before* anything is
   mounted. It registers the tool's queue handlers (`queue.register(kind, …)`) and loads any
   persisted state. Booting all tools up front means the queue can run actions for a tool that
