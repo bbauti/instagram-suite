@@ -16,7 +16,7 @@ build and lost. Change `src/`, rebuild, re-paste.
 ## Build / test commands
 
 ```bash
-npm install                 # one-time; installs esbuild (the only devDependency)
+npm install                 # one-time; installs esbuild + lit-html (the two devDependencies)
 npm run build               # bundles src/main.js -> dist/instagram-suite.js (esbuild --bundle --format=iife)
 npm run watch               # rebuild on save
 ```
@@ -34,11 +34,12 @@ core/state.js      app = { root, view, active } — shared mutable app/DOM state
 core/api.js        RateLimit + ApiError classes; api client; scanList() paginator
 core/queue.js      global paced action queue; SPEEDS, KIND_VERB, MAX_RETRIES=4
 ui/css.js          CSS string (one Müller-Brockmann design system)
-ui/components.js   avatar, badge, profileLink, toast, scanOverlay, chartSVG
+ui/components.js   avatar/badge/profileLink (lit templates), toast, scanOverlay, chartSVG
 ui/shell.js        module registry + SPA shell: renderShell, mountModule, teardown, renderQueuePanel, setModules
 tools/ledger.js    export const ledger
 tools/followers.js export const followers
 tools/pending.js   export const pending
+tools/pending-import.js  pure ZIP reader + export parsers (classify/parseText/ingestZip/buildData), used by pending.js
 selftest.js        selfTest() — exposed as globalThis.__igsSelfTest
 main.js            entry: teardown, inject CSS, boot tools, render shell, expose globalThis.IGS
 ```
@@ -48,9 +49,9 @@ main.js            entry: teardown, inject CSS, boot tools, render shell, expose
 Each tool is an object: `{ id, label, boot(), mount(el), unmount(), onQueueChange() }`.
 
 - `boot()` — register queue handlers and load persisted state (called once at startup).
-- `mount(el)` — render the tool's HTML into the given container.
+- `mount(el)` — render the tool's UI into the given container (sets `container`, calls `update()`).
 - `unmount()` — tear down (the shell calls this on the outgoing tool before swapping).
-- `onQueueChange()` — re-render the queue-affected part when queue state changes.
+- `onQueueChange()` — call `update()` to re-render when queue state changes.
 
 `src/main.js` holds the list `const modules = [ledger, followers, pending]`, calls
 `setModules(modules)`, then `modules.forEach(m => m.boot?.())`. The shell's `mountModule(id)`
@@ -103,9 +104,11 @@ do not reintroduce one by importing the shell from a tool for state.
   `structuredClone`, `replaceAll`, `dataset`, `crypto.getRandomValues`.
 - Lean and minimal: the smallest thing that works, lightly commented.
 - Documentation lives in `docs/`, NOT as comment walls in the code.
-- Rendering: full `render()` on structural change; partial re-renders
-  (`refreshListBody`/`renderCards`/`refreshRows`) for search/filter/queue updates to preserve
-  focus + scroll. Rendered rows cap at `ROW_CAP=600`; search still filters the full set.
+- Rendering: lit-html. Each tool has one `template()` and `update = () => render(template(),
+  container)`; bind events inline (`@click`/`@input`) and call `update()` on any state change —
+  lit diffs so search focus + scroll survive (no manual partial re-renders). Search inputs use
+  `` .value=${live(st.query)} ``; user lists are keyed with `repeat(…, u => u.id, …)`. Rendered
+  rows cap at `ROW_CAP=600`; search still filters the full set.
 - Do NOT propose refactors or invent features. Match the existing structure.
 
 ## Safety

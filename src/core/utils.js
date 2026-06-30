@@ -18,26 +18,53 @@ export const fmtDelta = (n) => {
 };
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // crypto RNG (jitter only) — equivalent to Math.random here
-export const randInt = (a, b) => a + Math.floor(crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32 * (b - a + 1));
-export const uid = (() => { let n = 0; return () => `a${Date.now().toString(36)}${n++}`; })();
+export const randInt = (min, max) => {
+  const fraction = crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32;
+  return min + Math.floor(fraction * (max - min + 1));
+};
+
+export const uid = (() => {
+  let counter = 0;
+  return () => `a${Date.now().toString(36)}${counter++}`;
+})();
 
 export const fmtAgo = (ts) => {
   if (!ts) return 'never';
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24); if (d < 30) return `${d}d ago`;
+
+  const seconds = Math.floor((Date.now() - ts) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+
   return new Date(ts).toLocaleDateString();
 };
-export const fmtDate = (ts) => { try { return new Date(ts).toLocaleString(); } catch { return '—'; } };
+
+export const fmtDate = (ts) => {
+  try {
+    return new Date(ts).toLocaleString();
+  } catch {
+    return '—';
+  }
+};
+
 export const fmtCountdown = (ms) => {
   if (ms <= 0) return 'now';
-  const s = Math.ceil(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m ${s % 60}s`;
+
+  const seconds = Math.ceil(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.floor(seconds / 60);
+  if (minutes >= 60) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return `${minutes}m ${seconds % 60}s`;
 };
 
 export const byId = (list) => Object.fromEntries((list || []).map((u) => [u.id, u]));

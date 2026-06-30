@@ -8,6 +8,8 @@ import { uid, randInt } from './utils.js';
 import { RateLimit, ApiError } from './api.js';
 
 const QKEY = 'igs-queue';
+
+// Pacing presets: random delay (ms) inserted between consecutive actions.
 export const SPEEDS = {
   safe: { min: 45000, max: 90000, label: 'Safe · 45–90s' },
   normal: { min: 25000, max: 50000, label: 'Normal · 25–50s' },
@@ -18,96 +20,201 @@ const RL_WAIT_MS = 10 * 60 * 1000;
 export const KIND_VERB = { unfollow: 'Unfollowing', follow: 'Following', cancel: 'Cancelling', verify: 'Checking', 'fm-follow': 'Following', 'fm-unfollow': 'Unfollowing' };
 
 export const queue = {
-  items: [], paused: false, cooldownUntil: 0, rateLimitedUntil: 0, speedKey: 'safe',
-  _busy: false, _timer: null, handlers: {},
-  onChange: () => {}, onTick: () => {},
+  // ── state ──
+  items: [],
+  paused: false,
+  cooldownUntil: 0,
+  rateLimitedUntil: 0,
+  speedKey: 'safe',
+  _busy: false,
+  _timer: null,
+  handlers: {},
+  onChange: () => {},
+  onTick: () => {},
 
-  register(kind, handler) { this.handlers[kind] = handler; },
-  load() {
-    const s = store.get(QKEY, null);
-    if (!s || !Array.isArray(s.items)) return;
-    this.items = s.items; this.paused = !!s.paused;
-    this.cooldownUntil = s.cooldownUntil || 0; this.speedKey = s.speedKey || 'safe';
-    this.items.forEach((i) => { if (i.status === 'running') { i.status = 'pending'; i.nextRunAt = Date.now() + randInt(4000, 12000); } });
+  // ── registration & persistence ──
+  register(kind, handler) {
+    this.handlers[kind] = handler;
   },
-  persist() { store.save(QKEY, { items: this.items, paused: this.paused, cooldownUntil: this.cooldownUntil, speedKey: this.speedKey }); },
-  speed() { return SPEEDS[this.speedKey] || SPEEDS.safe; },
+  load() {
+    const saved = store.get(QKEY, null);
+    if (!saved || !Array.isArray(saved.items)) return;
+    this.items = saved.items;
+    this.paused = !!saved.paused;
+    this.cooldownUntil = saved.cooldownUntil || 0;
+    this.speedKey = saved.speedKey || 'safe';
+    // Anything caught mid-run by a refresh gets requeued with a short delay.
+    this.items.forEach((item) => {
+      if (item.status === 'running') {
+        item.status = 'pending';
+        item.nextRunAt = Date.now() + randInt(4000, 12000);
+      }
+    });
+  },
+  persist() {
+    store.save(QKEY, { items: this.items, paused: this.paused, cooldownUntil: this.cooldownUntil, speedKey: this.speedKey });
+  },
+
+  // ── queries ──
+  speed() {
+    return SPEEDS[this.speedKey] || SPEEDS.safe;
+  },
   statusOf(userId, kind) {
-    const it = this.items.find((i) => i.userId === userId && (!kind || i.kind === kind));
-    return it?.status ?? null;
+    const match = this.items.find((item) => item.userId === userId && (!kind || item.kind === kind));
+    return match?.status ?? null;
   },
   summary() {
-    const c = { pending: 0, running: 0, done: 0, failed: 0 };
-    this.items.forEach((i) => { c[i.status] = (c[i.status] || 0) + 1; });
-    return c;
+    const counts = { pending: 0, running: 0, done: 0, failed: 0 };
+    this.items.forEach((item) => { counts[item.status] = (counts[item.status] || 0) + 1; });
+    return counts;
   },
+
+  // ── mutations ──
   add(item) {
-    if (this.items.some((i) => i.userId === item.userId && i.kind === item.kind && i.status !== 'failed')) return false;
+    const duplicate = this.items.some((existing) => existing.userId === item.userId && existing.kind === item.kind && existing.status !== 'failed');
+    if (duplicate) return false;
     this.items.push({ id: uid(), status: 'pending', attempts: 0, nextRunAt: Date.now(), ...item });
     return true;
   },
   enqueue(items) {
-    const added = items.reduce((acc, it) => acc + (this.add(it) ? 1 : 0), 0);
-    if (added) { this.paused = false; this.persist(); this.start(); this.changed(); }
+    const added = items.reduce((acc, item) => acc + (this.add(item) ? 1 : 0), 0);
+    if (added) {
+      this.paused = false;
+      this.persist();
+      this.start();
+      this.changed();
+    }
     return added;
   },
-  removeItem(id) { this.items = this.items.filter((i) => i.id !== id || i.status === 'running'); this.persist(); this.changed(); },
-  cancelPending() { this.items = this.items.filter((i) => i.status === 'running' || i.status === 'done'); this.persist(); this.changed(); },
-  clearFinished() { this.items = this.items.filter((i) => i.status === 'pending' || i.status === 'running'); this.persist(); this.changed(); },
-  retryItem(id) {
-    const it = this.items.find((i) => i.id === id);
-    if (it && it.status === 'failed') { it.status = 'pending'; it.attempts = 0; it.nextRunAt = Date.now(); it.error = undefined; this.persist(); this.start(); this.changed(); }
+  removeItem(id) {
+    this.items = this.items.filter((item) => item.id !== id || item.status === 'running');
+    this.persist();
+    this.changed();
   },
-  pause() { this.paused = true; this.persist(); this.changed(); },
-  resume() { this.paused = false; this.rateLimitedUntil = 0; this.persist(); this.start(); this.changed(); },
-  start() { if (!this._timer) this._timer = setInterval(() => this.tick(), 1000); },
-  stop() { if (this._timer) { clearInterval(this._timer); } this._timer = null; },
+  cancelPending() {
+    this.items = this.items.filter((item) => item.status === 'running' || item.status === 'done');
+    this.persist();
+    this.changed();
+  },
+  clearFinished() {
+    this.items = this.items.filter((item) => item.status === 'pending' || item.status === 'running');
+    this.persist();
+    this.changed();
+  },
+  retryItem(id) {
+    const item = this.items.find((candidate) => candidate.id === id);
+    if (item && item.status === 'failed') {
+      item.status = 'pending';
+      item.attempts = 0;
+      item.nextRunAt = Date.now();
+      item.error = undefined;
+      this.persist();
+      this.start();
+      this.changed();
+    }
+  },
+
+  // ── lifecycle ──
+  pause() {
+    this.paused = true;
+    this.persist();
+    this.changed();
+  },
+  resume() {
+    this.paused = false;
+    this.rateLimitedUntil = 0;
+    this.persist();
+    this.start();
+    this.changed();
+  },
+  start() {
+    if (!this._timer) this._timer = setInterval(() => this.tick(), 1000);
+  },
+  stop() {
+    if (this._timer) { clearInterval(this._timer); }
+    this._timer = null;
+  },
   etaMs() {
     const pending = this.summary().pending;
     if (!pending) return 0;
-    const sp = this.speed();
-    return Math.max(0, this.cooldownUntil - Date.now()) + pending * (sp.min + sp.max) / 2;
+    const speed = this.speed();
+    return Math.max(0, this.cooldownUntil - Date.now()) + pending * (speed.min + speed.max) / 2;
   },
-  changed() { this.onChange(); },
+  changed() {
+    this.onChange();
+  },
 
+  // ── engine ──
   async tick() {
     this.onTick();
+
+    // Auto-resume once a rate-limit pause has expired.
     if (this.rateLimitedUntil && Date.now() >= this.rateLimitedUntil) {
       this.rateLimitedUntil = 0;
-      if (this.paused) { this.paused = false; this.persist(); this.changed(); }
+      if (this.paused) {
+        this.paused = false;
+        this.persist();
+        this.changed();
+      }
     }
+
     if (this._busy || this.paused) return;
     const now = Date.now();
     if (now < this.cooldownUntil || now < this.rateLimitedUntil) return;
-    const item = this.items.find((i) => i.status === 'pending' && i.nextRunAt <= now);
+
+    // Pick the next due pending item; bail if there's nothing to run.
+    const item = this.items.find((candidate) => candidate.status === 'pending' && candidate.nextRunAt <= now);
     if (!item) return;
     const handler = this.handlers[item.kind];
-    if (!handler) { item.status = 'failed'; item.error = 'no handler'; this.persist(); this.changed(); return; }
+    if (!handler) {
+      item.status = 'failed';
+      item.error = 'no handler';
+      this.persist();
+      this.changed();
+      return;
+    }
 
-    this._busy = true; item.status = 'running'; item.attempts += 1; this.persist(); this.changed();
+    this._busy = true;
+    item.status = 'running';
+    item.attempts += 1;
+    this.persist();
+    this.changed();
     try {
-      const res = await handler.run(item);
+      const result = await handler.run(item);
       item.status = 'done';
-      handler.onDone?.(item, res);
+      handler.onDone?.(item, result);
     } catch (err) {
       if (err instanceof RateLimit) this._onRateLimit(item);
       else this._onFailure(item, err, handler);
     } finally {
-      const sp = this.speed();
-      this.cooldownUntil = Date.now() + randInt(sp.min, sp.max);
-      this._busy = false; this.persist(); this.changed();
+      // Cooldown before the next action, regardless of outcome.
+      const speed = this.speed();
+      this.cooldownUntil = Date.now() + randInt(speed.min, speed.max);
+      this._busy = false;
+      this.persist();
+      this.changed();
     }
   },
   _onFailure(item, err, handler) {
     item.error = String(err?.message || err);
-    if (err instanceof ApiError && err.status === 404) { item.status = 'failed'; }
-    else if (item.attempts >= MAX_RETRIES) { item.status = 'failed'; }
-    else { item.status = 'pending'; item.nextRunAt = Date.now() + Math.min(16, 2 ** (item.attempts - 1)) * 60000; }
+    if (err instanceof ApiError && err.status === 404) {
+      // Missing target — no point retrying.
+      item.status = 'failed';
+    } else if (item.attempts >= MAX_RETRIES) {
+      item.status = 'failed';
+    } else {
+      // Exponential backoff in minutes: 1, 2, 4, 8, 16 (capped at 16).
+      item.status = 'pending';
+      item.nextRunAt = Date.now() + Math.min(16, 2 ** (item.attempts - 1)) * 60000;
+    }
     if (item.status === 'failed') handler.onFail?.(item, err);
   },
   _onRateLimit(item) {
-    item.status = 'pending'; item.attempts = Math.max(0, item.attempts - 1);
+    // Don't burn a retry on a rate limit; pause the whole queue and wait it out.
+    item.status = 'pending';
+    item.attempts = Math.max(0, item.attempts - 1);
     item.nextRunAt = Date.now() + RL_WAIT_MS;
-    this.paused = true; this.rateLimitedUntil = Date.now() + RL_WAIT_MS;
+    this.paused = true;
+    this.rateLimitedUntil = Date.now() + RL_WAIT_MS;
   },
 };

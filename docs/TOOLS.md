@@ -6,8 +6,9 @@ client, the store, and the SPA shell). The nav at the top of the overlay switche
 
 Every tool is the same object contract — `{ id, label, boot(), mount(el), unmount(), onQueueChange() }`
 — defined in its file under `src/tools/`. `boot()` registers the tool's queue handlers and loads
-persisted state; `mount(el)` renders into the container the shell gives it; `onQueueChange()` is
-called by the shell whenever queue state changes so the tool can re-render the affected part.
+persisted state; `mount(el)` renders into the container the shell gives it (via lit-html);
+`onQueueChange()` is called by the shell whenever queue state changes so the tool can re-render
+(it calls `update()`; lit diffs the DOM).
 
 All three share the single paced queue in `src/core/queue.js`. A tool never runs an action itself:
 it calls `queue.register(kind, handler)` once in `boot()` and `queue.enqueue([items])` to schedule
@@ -59,7 +60,7 @@ The select-to-unfollow toolbar (`selToolHTML`) appears only on the three tabs in
    nothing is saved.
 2. The first scan saves a **baseline** ("Scan again later for a full change report"). The second and
    later scans produce a diff and toast `N new · M removed since last scan`.
-3. Browse tabs, **Search** by username/full name (partial re-render keeps focus), **Export** the full
+3. Browse tabs, **Search** by username/full name (lit diffing keeps focus), **Export** the full
    ledger as JSON.
 4. On Following / Mutuals / Don't-follow-back: tick accounts (or per-row **Unfollow**), then
    **Unfollow selected →**. A confirm shows the count, pace, and a rough ETA; the work goes onto the
@@ -147,7 +148,7 @@ Filter chips (`FILTERS` / `matchFilter`): **All**, **Public**, **Private**, **Ve
    logged in, refreshes profile details via `api.getWebProfile`.
 2. **Scan followers** (`runScan`) — `scanList('followers', …, profile.id, …)` paginates the target's
    followers with a progress overlay; cancellable.
-3. **Search** / filter the card grid (partial `renderCards` keeps focus and scroll).
+3. **Search** / filter the card grid (lit diffing keeps focus and scroll).
 4. Per card: **Load details** to enrich, **Follow** / **Unfollow**, or open the profile link.
 5. **Export** the profile + loaded users as JSON.
 

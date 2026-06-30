@@ -31,20 +31,25 @@ page's own JavaScript context, reusing your logged-in session cookies for API ca
 Development happens in many small ES modules; distribution is a single self-contained file.
 
 ```bash
-npm install        # one-time: installs esbuild (the only devDependency)
+npm install        # one-time: installs esbuild + lit-html (the two devDependencies)
 npm run build      # bundles src/main.js -> dist/instagram-suite.js (IIFE)
 npm run watch      # rebuild on save
 ```
 
+**esbuild** (bundler) and **lit-html** (the UI rendering library) are the two devDependencies.
+lit-html is bundled into the IIFE, so there is nothing extra to install at runtime.
+
 The exact build command (from `package.json`) is:
 
 ```
-esbuild src/main.js --bundle --format=iife --outfile=dist/instagram-suite.js
+esbuild src/main.js --bundle --format=iife --minify --charset=utf8 --legal-comments=none --outfile=dist/instagram-suite.js
 ```
 
 `--format=iife` wraps the whole graph in one immediately-invoked function so a single paste
-executes top to bottom with no module loader. `dist/instagram-suite.js` carries a banner
-warning not to edit it directly.
+executes top to bottom with no module loader. `--minify` shrinks the output (it renames only
+local identifiers, so the `globalThis.IGS` handle and the `console` self-test survive);
+`--charset=utf8` keeps the UI glyphs raw; `--legal-comments=none` strips bundled-dep license
+comments. `dist/instagram-suite.js` carries a banner warning not to edit it directly.
 
 ---
 
@@ -170,8 +175,8 @@ Every tool is a plain object with this shape (see `tools/ledger.js`, `tools/foll
 - **`mount(el)`** — render the tool's full UI into the supplied container (`app.view`).
 - **`unmount()`** — cleanup hook on tab switch / teardown (e.g. Followers persists
   `igs-fm-last` here).
-- **`onQueueChange()`** — re-render the parts affected by queue state (queued/running/done
-  badges, counts) when the queue changes. Tools keep this cheap with partial re-renders.
+- **`onQueueChange()`** — call `update()` to re-render when the queue changes (queued/running/
+  done badges, counts). lit diffs the DOM, so re-rendering the whole tool stays cheap.
 
 `main.js` is the only place that knows the concrete list:
 
@@ -282,20 +287,28 @@ without a full re-render.
 
 ## The rendering model
 
-Tools build **HTML strings** into their container and assign `innerHTML`, then wire event
-handlers. The model balances simplicity against preserving user context:
+The UI is rendered with **lit-html**. Each tool exposes one pure `template()` returning an
+`` html`…` `` template for its whole view, plus `const update = () => render(template(), container)`.
+Any state change calls `update()`; lit diffs the live DOM and patches only what changed.
 
-- **Full `render()`** on structural change (tab switch, after a scan). It rebuilds the whole
-  container and re-wires handlers.
-- **Partial re-renders** for search, filter, and queue updates — e.g. Ledger's
-  `refreshListBody()` (replaces only `[data-list]`), `refreshDynamic()` (metrics + tab counts
-  + list + selection count), Followers' `renderCards()`, Pending's `refreshRows()`. These
-  touch only the changed sub-tree.
+- **One code path.** There are no manual partial re-renders. Tab switches, search, filter, and
+  queue updates all just call `update()` and lit reconciles. (The pre-lit version hand-wrote
+  `refreshListBody`/`renderCards`/`refreshRows` to touch sub-trees; lit makes that unnecessary.)
+- **Events are inline** — `@click`, `@input`, `@change` — so there is no separate wiring step
+  and no event delegation to maintain.
 
-**Why partials matter:** typing in the search box calls `refreshListBody()`, which rewrites
-the results list but leaves the search `<input>` (in a sibling toolbar) untouched — so
-**focus and caret position are preserved** and the page doesn't jump. The same applies to
-queue badges updating mid-scroll: only the rows redraw, so **scroll position is preserved**.
+**Why diffing matters:** because lit patches in place instead of replacing `innerHTML`, typing
+in the search box re-renders the whole tool without recreating the `<input>`, so **focus and
+caret survive** (search inputs bind `.value=${live(st.query)}`; the `live` directive keeps the
+value in sync without resetting the cursor). Likewise queue badges updating mid-scroll only
+patch the changed nodes, so **scroll position is preserved**. Avatar-bearing lists are keyed
+with `` repeat(items, u => u.id, …) `` so a row's node (and its image) is never recycled onto a
+different user.
+
+**Shared fragments** (`ui/components.js`) — `avatar`, `badge`, `profileLink` — return lit
+templates and compose via `${…}`. `toast`, `scanOverlay`, and the pure-SVG `chartSVG` stay
+imperative/string-built (transient nodes outside the declarative tree; `chartSVG` is injected
+with the `unsafeHTML` directive).
 
 **Row cap.** Rendered rows are capped at `ROW_CAP = 600` (from `core/constants.js`). The cap
 applies to *output only*: search/filter always run over the full set first, then the result is
@@ -333,8 +346,8 @@ how the layers cooperate:
    plus `verified` / `private`. The result is held in the module-local `MODEL`.
 8. **Render.** `render()` paints the dashboard (big numerals + deltas), the pure-SVG
    `chartSVG(timeline)`, the breakdown tabs, and a toast summarizing the diff. Subsequent
-   queue-driven unfollows feed back through the same store → `rebuildModel` → partial
-   re-render path (`afterUnfollow` + `onQueueChange`).
+   queue-driven unfollows feed back through the same store → `rebuildModel` → `update()`
+   (`afterUnfollow` + `onQueueChange`).
 
 ---
 

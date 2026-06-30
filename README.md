@@ -106,8 +106,9 @@ Import your official **Instagram data export** and clean up follow requests you
 ## For developers
 
 The pasteable file in `dist/` is **generated** from modular sources under `src/`.
-The codebase is deliberately lean and lightly commented, written in modern ES.
-Documentation lives in `docs/`, not in comment walls.
+The codebase is deliberately lean and lightly commented, written in modern ES; the UI is
+rendered with [lit-html](https://lit.dev/docs/libraries/standalone-templates/) (bundled into
+the output). Documentation lives in `docs/`, not in comment walls.
 
 ### Source layout
 
@@ -128,6 +129,7 @@ src/
     ledger.js      export const ledger
     followers.js   export const followers
     pending.js     export const pending
+    pending-import.js  pure ZIP reader + export parsers used by pending.js
   selftest.js      selfTest() — runnable check on diff/backoff/esc logic (globalThis.__igsSelfTest)
   main.js          entry: teardown previous, inject CSS, boot tools, render shell, expose globalThis.IGS
 dist/
@@ -136,16 +138,18 @@ dist/
 
 ### Build workflow
 
-Requires Node + npm. `esbuild` is the only devDependency.
+Requires Node + npm. Two devDependencies: `esbuild` (bundler) and `lit-html` (UI rendering,
+bundled into the output). No runtime dependencies.
 
 ```bash
-npm install        # one-time: installs esbuild
+npm install        # one-time: installs esbuild + lit-html
 npm run build      # bundle src/main.js → dist/instagram-suite.js (IIFE)
 npm run watch      # rebuild on every save
 ```
 
-`npm run build` runs `esbuild src/main.js --bundle --format=iife`, producing
-`dist/instagram-suite.js` — the IIFE you paste into the console.
+`npm run build` runs `esbuild src/main.js --bundle --format=iife --minify` (plus
+`--charset=utf8 --legal-comments=none`), producing a minified `dist/instagram-suite.js` — the
+IIFE you paste into the console.
 
 ### The golden rule
 
@@ -183,14 +187,14 @@ root:
 ├── src/                     modular source (edit here)
 │   ├── core/                constants, utils, store, state, api, queue
 │   ├── ui/                  css, components, shell
-│   ├── tools/               ledger, followers, pending
+│   ├── tools/               ledger, followers, pending, pending-import
 │   ├── selftest.js          self-check (__igsSelfTest)
 │   └── main.js              entry point
 ├── docs/                    architecture, development, tools, api docs
 ├── README.md                this file
 ├── AGENTS.md                guide for AI coding agents
 ├── LICENSE                  MIT
-├── package.json             build scripts + esbuild devDependency
+├── package.json             build scripts + esbuild/lit-html devDependencies
 └── .gitignore
 ```
 
