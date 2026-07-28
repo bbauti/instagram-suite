@@ -3,7 +3,7 @@
 This document describes how Instagram Suite talks to Instagram. All of it lives in
 [`src/core/api.js`](../src/core/api.js), backed by a handful of values in
 [`src/core/constants.js`](../src/core/constants.js). There is **one** client object,
-`api`, shared by all three tools (Ledger, Followers, Pending).
+`api`, shared by all four tools (Ledger, Followers, Posts, Pending).
 
 > **Disclaimer — read this first.** Everything below uses Instagram's *private*,
 > *unofficial* web endpoints (the same ones the website calls internally). They are
@@ -128,6 +128,77 @@ GET /graphql/query/?query_hash=<HASH.highlights>&variables=<json>
 suggested-user extras). Items come from `data.user.edge_highlight_reels.edges`, with the
 cover taken from `cover_media_cropped_thumbnail.url` or `cover_media.thumbnail_src`.
 
+#### Fallback: `topsearch` + `users/<pk>/info/`
+
+`web_profile_info` fails outright on some **business accounts**: Instagram's own profile
+serializer errors on a schema field Meta deleted, and the response is
+
+```json
+{ "message": "Asset asset://laser.provider/ig_business_category_subvertical has been deleted. You cannot use this schema", "status": "fail" }
+```
+
+Note it arrives as `status: "fail"` — possibly with HTTP 200 — which is why `_fetch` treats
+`body.status === 'fail'` as an `ApiError` regardless of status code. Without that, the missing
+`data.user` reads as "profile not found" and the real cause never reaches the UI.
+
+On any non-`RateLimit` failure, `getWebProfile` falls back to two requests off a different
+backend:
+
+```
+GET /web/search/topsearch/?context=blended&query=<username>   -> resolve username to pk
+GET /api/v1/users/<pk>/info/                                  -> counts + friendship_status
+```
+
+The result is mapped by `api._mapUserInfo` into the same shape `web_profile_info` returns, with
+two differences: `posts` is always `[]` (this path carries no thumbnails — consumers should read
+`postsCount` to tell "no posts" from "no thumbnails"), and `mutualCount` comes from
+`mutual_followers_count`. If search can't resolve the username either, the **original** error is
+re-thrown, so a genuinely missing profile still reports as missing.
+
+### `feed/user` — a page of a profile's posts
+
+```
+GET /api/v1/feed/user/<userId>/?count=33[&max_id=<cursor>]
+```
+
+`api.mediaPage(userId, after)` returns `{ posts, next, total }`. `posts` are normalised by
+`api._mapMedia`, `next` is `body.next_max_id` while `body.more_available` is true. Page size
+is `POST_PAGE = 33` (`constants.js`).
+
+Unlike `web_profile_info` (which only ever exposes the newest 3 posts, thumbnail + shortcode),
+this endpoint carries the full per-post payload: `like_count`, `comment_count`,
+`play_count`/`ig_play_count`, `taken_at`, `media_type` + `product_type`, `caption.text`,
+`location`, `usertags`, `timeline_pinned_user_ids`, `comments_disabled`,
+`carousel_media_count` and `video_duration`.
+
+**Saves are not in this payload, or in any other public endpoint** — Instagram only exposes them
+to the account owner through Insights. The one share-like number that *is* public is
+`media_repost_count` (mapped to `reposts`): how many times the media was reposted through the
+Reels repost feature. It is absent on most posts, and it does not count DM sends or story shares,
+so treat it as a weak signal rather than a share count.
+
+Two mapping rules matter downstream:
+
+- `like_and_view_counts_disabled`, or a `like_count` below zero, maps to `likes: null` — the
+  owner hid the counts. This is deliberately distinct from `0` so averages and sorts can skip it.
+- `type` is derived: `media_type === 8` → `carousel`; `product_type === 'clips'` → `reel`;
+  `media_type === 2` → `video`; otherwise `photo`.
+- `views` prefers `play_count` (Instagram **plus** Facebook) over `ig_play_count` (Instagram only).
+  A live reel showed `play_count: 2265` = `ig_play_count: 1785` + `fb_play_count: 480`. Stills carry
+  neither, so `views` is `null` there.
+
+#### GraphQL media fallback
+
+On any non-`RateLimit` error it falls back to `HASH.media`:
+
+```
+GET /graphql/query/?query_hash=<HASH.media>&variables={"id":"<userId>","first":12[,"after":"<cursor>"]}
+```
+
+Nodes come from `data.user.edge_owner_to_timeline_media.edges` and are mapped by
+`api._mapMediaGraph` into the same shape. The GraphQL node carries no pin state and no
+`product_type`, so on this path `pinned` is always `false` and reels read as plain `video`.
+
 ### `friendships/show` — friendship status
 
 ```
@@ -175,6 +246,7 @@ export const HASH = {
   followers:  'c76146de99bb02f6415203be841dd25a', // edge_followed_by
   following:  '3dec7e2c57367ef3da3d987d89f9dbc8', // edge_follow
   highlights: 'd4d88dc1500312af6f937f7b804c68c3', // edge_highlight_reels
+  media:      'e769aa130647d2354c40ea6a439bfc08', // edge_owner_to_timeline_media
 };
 export const EDGE = { followers: 'edge_followed_by', following: 'edge_follow' };
 ```
@@ -235,8 +307,8 @@ above.
 
 ## Pagination — `scanList`
 
-`scanList(kind, onProgress, userId, shouldCancel)` walks a whole follower/following
-list by repeatedly calling `api.page()` and stitching the pages together.
+`scanList(kind, onProgress, userId, shouldCancel, shouldStop)` walks a whole
+follower/following list by repeatedly calling `api.page()` and stitching the pages together.
 
 - **Page size** is `PAGE_SIZE = 48` (`constants.js`) — `first` for GraphQL, `count` for
   the `api/v1` fallback.
@@ -247,7 +319,10 @@ list by repeatedly calling `api.page()` and stitching the pages together.
 - **Progress**: `onProgress(kind, users.length, total)` is called after every page;
   `total` comes from the list count when available.
 - **Cancellation**: if `shouldCancel?.()` returns truthy, the scan throws
-  `Error('cancelled')`.
+  `Error('cancelled')` and the result is discarded.
+- **Stop & keep**: if `shouldStop?.()` returns truthy, the scan returns the users
+  collected so far (a partial list) instead of throwing; the callers mark the resulting
+  snapshot `partial: true`.
 - **Human pacing** — between pages it sleeps a jittered amount, with a longer pause every
   sixth page to look less like a bot:
 
@@ -258,6 +333,16 @@ await sleep(pages % 6 === 0 ? randInt(4000, 8000) : randInt(700, 1700));
 So roughly 0.7–1.7 s between normal pages and 4–8 s on every sixth. Combined with the
 queue's pacing for write actions, this keeps scans well under Instagram's radar — see
 the [safety note](#safety).
+
+### `scanPosts` — the same walk over a timeline
+
+`scanPosts(userId, onProgress, max, shouldCancel, shouldStop)` is the media equivalent: same
+cursor chaining, same `Set` de-duplication, same cancel / stop-and-keep contract, same jittered
+pacing. It calls `api.mediaPage()` instead of `api.page()`, its progress callback is
+`onProgress(posts.length, total)`, and it takes one extra argument — `max`, a ceiling that ends
+the walk once that many posts are collected (pass `Infinity` for the whole timeline). A 3 000-post
+account is ~90 requests, so the Posts tool defaults the ceiling to `POST_CAP_DEFAULT = 300`
+rather than committing to the full history.
 
 ---
 
@@ -328,7 +413,7 @@ the default queue speed is the conservative one — see below.
 These are private endpoints and Instagram actively rate-limits and action-blocks
 aggressive automation. The defaults exist for a reason:
 
-- Read scans are paced by `scanList`'s jittered sleeps.
+- Read scans are paced by `scanList`'s / `scanPosts`'s jittered sleeps.
 - Write actions are paced by the queue (default **safe** speed). Faster speeds
   materially raise block risk.
 - A single `RateLimit` pauses every tool for 10 minutes.

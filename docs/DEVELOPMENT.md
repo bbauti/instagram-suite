@@ -1,7 +1,7 @@
 # Development guide
 
 This is the contributor how-to for **Instagram Suite** — a single paste-into-the-console
-SPA bundling three tools (Ledger, Followers, Pending) over one shared core. There is no
+SPA bundling four tools (Ledger, Followers, Posts, Pending) over one shared core. There is no
 backend and no runtime build server: you build a single JS file locally and paste it into
 Chrome DevTools on `instagram.com`.
 
@@ -196,7 +196,7 @@ Import it and add it to the `modules` list passed to `setModules`:
 ```js
 import { mytool } from './tools/mytool.js';
 // ...
-const modules = [ledger, followers, pending, mytool];
+const modules = [ledger, followers, posts, pending, mytool];
 setModules(modules);
 modules.forEach((m) => m.boot?.());
 ```
@@ -258,7 +258,7 @@ export const KIND_VERB = { /* ...existing... */ 'mykind': 'Doing' };
 ```
 
 Existing registered kinds, for reference: `unfollow` (Ledger), `fm-follow` / `fm-unfollow`
-(Followers), `verify` / `cancel` (Pending).
+(Followers), `verify` / `cancel` (Pending). Posts registers none — it is read-only.
 
 > Keep `run` idempotent-ish and tolerant: items survive a refresh (`running` → `pending` on
 > reload), so an action may be attempted more than once.

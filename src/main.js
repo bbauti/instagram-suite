@@ -1,6 +1,6 @@
 // Entry point. Bundled by esbuild into dist/instagram-suite.js (IIFE) — the file
 // you paste into the console. Tears down any previous instance, injects the
-// stylesheet, boots the three tools through the shared queue, renders the shell
+// stylesheet, boots the tools through the shared queue, renders the shell
 // and exposes the `IGS` console handle.
 import { HOST } from './core/constants.js';
 import { api } from './core/api.js';
@@ -10,6 +10,7 @@ import { CSS } from './ui/css.js';
 import { renderShell, mountModule, teardown, renderQueuePanel, setModules } from './ui/shell.js';
 import { ledger } from './tools/ledger.js';
 import { followers } from './tools/followers.js';
+import { posts } from './tools/posts.js';
 import { pending } from './tools/pending.js';
 import { selfTest } from './selftest.js';
 
@@ -35,7 +36,7 @@ app.root.id = 'igs-root';
 document.body.appendChild(app.root);
 
 // ── boot the tools and restore the queue ──
-const modules = [ledger, followers, pending];
+const modules = [ledger, followers, posts, pending];
 setModules(modules);
 modules.forEach((m) => m.boot?.());
 queue.load();

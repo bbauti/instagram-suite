@@ -1,5 +1,5 @@
 // Instagram API — one client for all three tools.
-import { HOST, IG_APP_ID, PAGE_SIZE, HASH, EDGE, RATE_LIMIT_RE } from './constants.js';
+import { HOST, IG_APP_ID, PAGE_SIZE, POST_PAGE, HASH, EDGE, RATE_LIMIT_RE } from './constants.js';
 import { getCookie, sleep, randInt } from './utils.js';
 
 // Thrown when Instagram signals a rate limit / temporary action block.
@@ -40,7 +40,10 @@ export const api = {
       body?.feedback_required || body?.spam || body?.checkpoint_url ||
       RATE_LIMIT_RE.some((re) => re.test(bodyText));
     if (flagged) throw new RateLimit(body?.feedback_message || body?.message || `HTTP ${response.status}`);
-    if (!response.ok) throw new ApiError(body?.message || `HTTP ${response.status}`, response.status);
+    // Instagram sometimes serves a server-side failure as HTTP 200 with
+    // `{status:'fail', message}` — surface its message instead of letting the
+    // caller invent a "not found" from the missing payload.
+    if (!response.ok || body?.status === 'fail') throw new ApiError(body?.message || `HTTP ${response.status}`, response.ok ? 500 : response.status);
     return body;
   },
   request(url) {
@@ -70,8 +73,16 @@ export const api = {
   },
 
   // ── profile lookups ──
-  // Profile info + last 3 posts (web_profile_info)
+  // Profile info + last 3 posts (web_profile_info), with a search-based fallback.
   async getWebProfile(username) {
+    try {
+      return await this._webProfile(username);
+    } catch (err) {
+      if (err instanceof RateLimit) throw err;
+      return this._profileFallback(username, err);
+    }
+  },
+  async _webProfile(username) {
     const body = await this.request(`https://${HOST}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`);
     const user = body?.data?.user;
     if (!user) throw new ApiError(`Profile "${username}" not found`, 404);
@@ -95,6 +106,41 @@ export const api = {
         shortcode: edge.node.shortcode || '',
       })),
     };
+  },
+  // Same shape from `users/<pk>/info/`, which speaks the api/v1 dialect and
+  // carries no thumbnails.
+  _mapUserInfo(user) {
+    return {
+      id: String(user.pk ?? user.pk_id ?? user.id ?? ''),
+      username: user.username,
+      fullName: user.full_name || '',
+      picUrl: user.profile_pic_url || '',
+      picUrlHd: user.hd_profile_pic_url_info?.url || user.profile_pic_url || '',
+      isPrivate: !!user.is_private,
+      isVerified: !!user.is_verified,
+      followerCount: user.follower_count ?? 0,
+      followingCount: user.following_count ?? 0,
+      mutualCount: user.mutual_followers_count ?? 0,
+      postsCount: user.media_count ?? 0,
+      followedByViewer: user.friendship_status?.following ?? null,
+      requestedByViewer: user.friendship_status?.outgoing_request ?? null,
+      posts: [],
+    };
+  },
+  // web_profile_info fails outright on some business accounts — Instagram's own
+  // serializer 500s on a schema field Meta deleted ("Asset
+  // asset://laser.provider/ig_business_category_subvertical has been deleted").
+  // Search runs off a different backend, so it still resolves the id; then
+  // users/<pk>/info/ fills in the counts. If the account really doesn't exist,
+  // the original error is the honest one to report.
+  async _profileFallback(username, cause) {
+    const wanted = username.toLowerCase();
+    const search = await this.request(`https://${HOST}/web/search/topsearch/?context=blended&query=${encodeURIComponent(username)}`);
+    const hit = (search?.users || []).map((entry) => entry.user).find((u) => u?.username?.toLowerCase() === wanted);
+    if (!hit) throw cause;
+    const body = await this.request(`https://${HOST}/api/v1/users/${hit.pk}/info/`);
+    if (!body?.user) throw cause;
+    return this._mapUserInfo({ ...hit, ...body.user });
   },
   // Friendship status fallback (friendships/show)
   async getFriendship(userId) {
@@ -198,10 +244,94 @@ export const api = {
       };
     }
   },
+
+  // ── posts (timeline media) ──
+  // Normalise one api/v1 feed item. `likes: null` means "hidden by the owner" —
+  // distinct from 0, so it renders as — and stays out of averages / sorts.
+  _mapMedia(item) {
+    const image = item.image_versions2 || item.carousel_media?.[0]?.image_versions2;
+    const likeCount = item.like_count;
+    const productType = item.product_type || '';
+    let type = 'photo';
+    if (item.media_type === 8) type = 'carousel';
+    else if (productType === 'clips') type = 'reel';
+    else if (item.media_type === 2) type = 'video';
+    return {
+      id: String(item.pk ?? item.id),
+      shortcode: item.code || '',
+      thumb: image?.candidates?.at(-1)?.url || '',
+      likes: item.like_and_view_counts_disabled || !(likeCount >= 0) ? null : likeCount,
+      comments: item.comment_count ?? 0,
+      // play_count is IG + FB combined; ig_play_count is the Instagram-only slice.
+      views: item.play_count ?? item.ig_play_count ?? item.view_count ?? null,
+      // The Reels repost counter — the closest thing to a public "shares" number.
+      // Absent on most posts (DM sends and story shares are never exposed).
+      reposts: item.media_repost_count ?? 0,
+      ts: (item.taken_at || 0) * 1000,
+      type,
+      caption: item.caption?.text || '',
+      location: item.location?.name || '',
+      tagged: item.usertags?.in?.length ?? 0,
+      pinned: !!item.timeline_pinned_user_ids?.length,
+      commentsDisabled: !!(item.comments_disabled || item.disable_caption_and_comment),
+      slides: item.carousel_media_count ?? 0,
+      duration: item.video_duration ?? null,
+    };
+  },
+  // Same shape from a GraphQL edge_owner_to_timeline_media node (fallback path).
+  // It carries no pinned flag and no product_type, so reels read as plain video.
+  _mapMediaGraph(node) {
+    const likeCount = node.edge_liked_by?.count ?? node.edge_media_preview_like?.count;
+    const slides = node.edge_sidecar_to_children?.edges?.length ?? 0;
+    return {
+      id: String(node.id),
+      shortcode: node.shortcode || '',
+      thumb: node.thumbnail_src || node.display_url || '',
+      likes: likeCount >= 0 ? likeCount : null,
+      comments: node.edge_media_to_comment?.count ?? 0,
+      views: node.video_view_count ?? null,
+      reposts: 0,
+      ts: (node.taken_at_timestamp || 0) * 1000,
+      type: slides ? 'carousel' : (node.is_video ? 'video' : 'photo'),
+      caption: node.edge_media_to_caption?.edges?.[0]?.node?.text || '',
+      location: node.location?.name || '',
+      tagged: node.edge_media_to_tagged_user?.edges?.length ?? 0,
+      pinned: false,
+      commentsDisabled: !!node.comments_disabled,
+      slides,
+      duration: node.video_duration ?? null,
+    };
+  },
+  // One page of a user's own timeline. api/v1 primary, GraphQL fallback.
+  async mediaPage(userId, after) {
+    try {
+      const maxId = after ? `&max_id=${encodeURIComponent(after)}` : '';
+      const body = await this.request(`https://${HOST}/api/v1/feed/user/${userId}/?count=${POST_PAGE}${maxId}`);
+      if (!Array.isArray(body?.items)) throw new ApiError('bad feed payload', 0);
+      return {
+        posts: body.items.map((item) => this._mapMedia(item)),
+        next: body.more_available ? body.next_max_id : null,
+        total: body.total_count ?? null,
+      };
+    } catch (err) {
+      if (err instanceof RateLimit) throw err;
+      const vars = { id: String(userId), first: 12 };
+      if (after) vars.after = after;
+      const body = await this.request(`https://${HOST}/graphql/query/?query_hash=${HASH.media}&variables=${encodeURIComponent(JSON.stringify(vars))}`);
+      const connection = body?.data?.user?.edge_owner_to_timeline_media;
+      if (!connection) throw new ApiError('bad graphql media payload', 0);
+      return {
+        posts: (connection.edges || []).map((edge) => this._mapMediaGraph(edge.node)),
+        next: connection.page_info?.has_next_page ? connection.page_info.end_cursor : null,
+        total: connection.count ?? null,
+      };
+    }
+  },
 };
 
 // Paginate a whole list (followers|following) of `userId` with human pacing.
-export const scanList = async (kind, onProgress, userId, shouldCancel) => {
+// shouldCancel() aborts and discards; shouldStop() returns the partial list.
+export const scanList = async (kind, onProgress, userId, shouldCancel, shouldStop) => {
   const users = [];
   const seen = new Set();
   let after = null;
@@ -219,9 +349,38 @@ export const scanList = async (kind, onProgress, userId, shouldCancel) => {
     pages += 1;
     onProgress(kind, users.length, total);
     if (shouldCancel?.()) throw new Error('cancelled');
+    if (shouldStop?.()) return users;
     after = pageResult.next;
     if (!after) return users;
     // Every 6th page, take a longer breather to look more human.
+    await sleep(pages % 6 === 0 ? randInt(4000, 8000) : randInt(700, 1700));
+  }
+};
+
+// Paginate a user's timeline, same pacing/cancel contract as scanList.
+// `max` caps the haul (Infinity for "everything") — a 3k-post account is ~90
+// requests, so the caller offers a ceiling instead of committing to all of it.
+export const scanPosts = async (userId, onProgress, max, shouldCancel, shouldStop) => {
+  const posts = [];
+  const seen = new Set();
+  let after = null;
+  let total = null;
+  let pages = 0;
+  for (;;) {
+    const pageResult = await api.mediaPage(userId, after);
+    if (pageResult.total != null) total = pageResult.total;
+    for (const p of pageResult.posts) {
+      if (!seen.has(p.id)) {
+        seen.add(p.id);
+        posts.push(p);
+      }
+    }
+    pages += 1;
+    onProgress(posts.length, total);
+    if (shouldCancel?.()) throw new Error('cancelled');
+    if (shouldStop?.()) return posts;
+    after = pageResult.next;
+    if (!after || posts.length >= max) return posts;
     await sleep(pages % 6 === 0 ? randInt(4000, 8000) : randInt(700, 1700));
   }
 };

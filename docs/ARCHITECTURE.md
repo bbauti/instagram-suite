@@ -1,7 +1,7 @@
 # Architecture
 
 This is the system-design reference for **Instagram Suite** — the console SPA that bundles
-three Instagram tools (**Ledger**, **Followers**, **Pending**) over one shared core. It
+four Instagram tools (**Ledger**, **Followers**, **Posts**, **Pending**) over one shared core. It
 describes the *post-refactor* layout under `src/`: a set of small ES modules bundled by
 esbuild into a single pasteable IIFE at `dist/instagram-suite.js`.
 
@@ -18,7 +18,7 @@ built file into Chrome DevTools, and a full-screen overlay opens. Everything run
 page's own JavaScript context, reusing your logged-in session cookies for API calls.
 
 - **One entry point**: `src/main.js` tears down any previous instance, injects the
-  stylesheet, boots the three tools through one shared queue, renders the shell, and exposes
+  stylesheet, boots the tools through one shared queue, renders the shell, and exposes
   the `globalThis.IGS` console handle.
 - **All state is local**: snapshots, history, and the action queue live in `localStorage`.
   Nothing is uploaded; there is no telemetry.
@@ -132,7 +132,7 @@ flow through data instead of through import edges.
 The shell is the chrome around the tools: top nav, the mounted-tool swap, the global queue
 panel, and teardown. It holds a private `modules` array, seeded by `main.js`:
 
-- **`setModules(mods)`** — receives the tool list `[ledger, followers, pending]`.
+- **`setModules(mods)`** — receives the tool list `[ledger, followers, posts, pending]`.
 - **`renderShell()`** — builds the overlay markup into `app.root`: brand, a nav button per
   module (`data-mod="<id>"`), a viewer badge (`api.viewerId`, with a warning if not on
   `instagram.com`), and the empty `#igs-view` container. It then caches
@@ -162,7 +162,7 @@ view stays in sync with the one shared queue.
 ## The tool contract
 
 Every tool is a plain object with this shape (see `tools/ledger.js`, `tools/followers.js`,
-`tools/pending.js`):
+`tools/posts.js`, `tools/pending.js`):
 
 ```js
 { id, label, requiresLogin?, boot(), mount(el), unmount(), onQueueChange() }
@@ -171,7 +171,7 @@ Every tool is a plain object with this shape (see `tools/ledger.js`, `tools/foll
 - **`id` / `label`** — stable id (used by `mountModule` and the nav `data-mod`) and the
   human nav label.
 - **`requiresLogin`** (optional) — `true` for tools that need the live IG API (Ledger,
-  Followers). Off instagram (`!api.loggedIn`) the shell disables their nav button and
+  Followers, Posts). Off instagram (`!api.loggedIn`) the shell disables their nav button and
   `mountModule` refuses to mount them; `main.js` opens the first usable tool instead (Pending,
   which works from an imported export). Pending omits the flag.
 - **`boot()`** — called once by `main.js` for every tool at startup, *before* anything is
@@ -182,24 +182,25 @@ Every tool is a plain object with this shape (see `tools/ledger.js`, `tools/foll
 - **`unmount()`** — cleanup hook on tab switch / teardown (e.g. Followers persists
   `igs-fm-last` here).
 - **`onQueueChange()`** — call `update()` to re-render when the queue changes (queued/running/
-  done badges, counts). lit diffs the DOM, so re-rendering the whole tool stays cheap.
+  done badges, counts). lit diffs the DOM, so re-rendering the whole tool stays cheap. Read-only
+  tools that never enqueue anything (Posts) omit it; the shell's call is optional-chained.
 
 `main.js` is the only place that knows the concrete list:
 
 ```js
-const modules = [ledger, followers, pending];
+const modules = [ledger, followers, posts, pending];
 setModules(modules);
 modules.forEach((m) => m.boot?.());
 ```
 
 Registered queue kinds, by tool: `unfollow` (Ledger); `fm-follow` / `fm-unfollow`
-(Followers); `verify` / `cancel` (Pending).
+(Followers); `verify` / `cancel` (Pending). Posts registers none — it is read-only.
 
 ---
 
 ## The queue engine in depth (`core/queue.js`)
 
-There is exactly **one** action queue, shared by all three tools. It owns pacing, retries,
+There is exactly **one** action queue, shared by every tool that acts. It owns pacing, retries,
 rate-limit handling, and persistence; tools only supply per-kind handlers and items.
 
 ```js
@@ -312,7 +313,10 @@ with `` repeat(items, u => u.id, …) `` so a row's node (and its image) is neve
 different user.
 
 **Shared fragments** (`ui/components.js`) — `avatar`, `badge`, `profileLink` — return lit
-templates and compose via `${…}`. `toast`, `scanOverlay`, and the pure-SVG `chartSVG` stay
+templates and compose via `${…}`. `avatar` layers the `<img>` over a letter `<div>`: a broken or
+expired CDN URL paints nothing (`alt=""`), so the letter shows through with no error handler. The
+shell's **↻** button refetches fresh URLs for the letter avatars on screen (`needsPic` picks them:
+no `<img>`, or one that finished loading with zero pixels) into the in-memory `picCache`. `toast`, `scanOverlay`, and the pure-SVG `chartSVG` stay
 imperative/string-built (transient nodes outside the declarative tree; `chartSVG` is injected
 with the `unsafeHTML` directive).
 
@@ -364,6 +368,7 @@ how the layers cooperate:
 | Queue     | `igs-queue`                                                                                    |
 | Ledger    | `igs-ledger-current`, `igs-ledger-previous`, `igs-ledger-timeline`, `igs-ledger-events`        |
 | Followers | `igs-fm-snap-<username>` (per profile), `igs-fm-last`                                          |
+| Posts     | `igs-posts-<username>` (per profile), `igs-posts-last`                                         |
 | Pending   | `igs-pending-data`, `igs-pending-results`, `igs-pending-history`                               |
 
 ---

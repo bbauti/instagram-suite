@@ -2,7 +2,10 @@
 // ink, one Swiss-red accent, mono labels, big numerals.
 export const CSS = [
   '#igs-root,#igs-root *{box-sizing:border-box;margin:0;padding:0;}',
-  '#igs-root{position:fixed;inset:0;z-index:2147483647;background:#fff;color:#111;',
+  // color-scheme pins the UA's form-control internals to light. Without it, on
+  // Instagram in dark mode the browser paints placeholders and the date-picker
+  // glyphs in their dark-mode colours — invisible on this white panel.
+  '#igs-root{position:fixed;inset:0;z-index:2147483647;background:#fff;color:#111;color-scheme:light;',
   'font-family:Inter,-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif;',
   'font-size:15px;line-height:1.5;overflow:auto;-webkit-font-smoothing:antialiased;',
   '--accent:#e4002b;--mut:#6b6b6b;--line:#111;--hair:#e3e3e3;--ok:#0a7d28;--blue:#0a558c;',
@@ -62,15 +65,22 @@ export const CSS = [
   '#igs-root input.search,#igs-root select,#igs-root input[type=number]{font:inherit;min-height:40px;border:2px solid var(--line);padding:0 10px;background:#fff;}',
   '#igs-root input.search{flex:1;max-width:320px;}',
   '#igs-root input.search:focus,#igs-root select:focus{outline:2px solid var(--accent);outline-offset:1px;}',
+  // explicit so it never depends on the UA default; opacity:1 undoes Firefox's .54
+  '#igs-root input::placeholder,#igs-root textarea::placeholder{color:#111;opacity:1;}',
   '#igs-root .chips{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 12px;}',
   '#igs-root .chip{font-family:var(--mono);font-size:11px;letter-spacing:.04em;text-transform:uppercase;border:2px solid var(--hair);background:#fff;color:var(--mut);min-height:34px;padding:0 10px;}',
   '#igs-root .chip.on{border-color:var(--accent);color:#fff;background:var(--accent);}',
+  '#igs-root .ranges{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:0 0 12px;}',
+  '#igs-root .ranges label{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);}',
+  '#igs-root .ranges input{width:88px;}',
   // list rows
   '#igs-root .rows{border-top:1px solid var(--hair);}',
   '#igs-root .row{display:flex;align-items:center;gap:14px;padding:10px 4px;border-bottom:1px solid var(--hair);}',
   '#igs-root .row.q-done{opacity:.5;}',
-  '#igs-root .av{width:44px;height:44px;border-radius:50%;flex:none;background:#f0f0f0;object-fit:cover;',
+  '#igs-root .av{position:relative;width:44px;height:44px;border-radius:50%;flex:none;background:#f0f0f0;',
   'display:flex;align-items:center;justify-content:center;font-weight:700;color:#999;font-size:16px;}',
+  // photo layered over the letter fallback: a broken/expired URL paints nothing
+  '#igs-root .av .pic{position:absolute;inset:0;width:100%;height:100%;border-radius:inherit;object-fit:cover;}',
   '#igs-root .row .meta{min-width:0;flex:1;}',
   '#igs-root .row .u{font-weight:600;}',
   '#igs-root .row .u a{color:#111;text-decoration:none;}',
@@ -101,11 +111,20 @@ export const CSS = [
   '#igs-root .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1px;background:var(--hair);border:1px solid var(--hair);margin-top:8px;}',
   '#igs-root .card{background:#fff;padding:14px;display:flex;flex-direction:column;gap:8px;}',
   '#igs-root .card .chead{display:flex;gap:10px;align-items:center;}',
+  // hover-zoom toggle: scale the 150px thumbnail up in place (CSS only, no JS)
+  '#igs-root .cards.zoom .av{transition:transform .12s ease-out;}',
+  '#igs-root .cards.zoom .av:hover{z-index:5;transform:scale(3.4);transform-origin:left center;border-radius:6px;box-shadow:0 4px 24px rgba(0,0,0,.35);}',
   '#igs-root .card .thumbs{display:flex;gap:4px;}',
   '#igs-root .card .thumbs img{width:33%;aspect-ratio:1;object-fit:cover;background:#f0f0f0;}',
   '#igs-root .card .hl{display:flex;gap:6px;flex-wrap:wrap;}',
   '#igs-root .card .hl span{font-family:var(--mono);font-size:10px;color:var(--mut);border:1px solid var(--hair);padding:2px 5px;}',
   '#igs-root .card .cact{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto;}',
+  // posts module: square shot (grid) + 44px thumb (list) + counters line
+  '#igs-root .card .shot{display:block;aspect-ratio:1;background:#f0f0f0;}',
+  '#igs-root .card .shot .pic,#igs-root .card .shot div{width:100%;height:100%;object-fit:cover;display:block;}',
+  '#igs-root .row .thumb{width:44px;height:44px;flex:none;object-fit:cover;background:#f0f0f0;display:block;}',
+  '#igs-root .pstats{font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;}',
+  '#igs-root .cap{font-size:13px;color:var(--mut);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;}',
   // dropzone
   '#igs-root .drop{border:2px dashed var(--line);padding:40px 20px;text-align:center;font-family:var(--mono);font-size:13px;color:var(--mut);cursor:pointer;}',
   '#igs-root .drop.over{border-color:var(--accent);background:#fff5f6;color:#111;}',

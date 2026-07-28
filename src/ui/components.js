@@ -2,24 +2,34 @@
 // the scan overlay (with optional Lottie enhancement) and the pure-SVG growth
 // chart. toast/scanOverlay stay imperative (transient nodes outside any tool's
 // declarative tree); chartSVG stays a string builder (injected via unsafeHTML).
-import { html } from 'lit-html';
+import { html, nothing } from 'lit-html';
 import { esc, $ } from '../core/utils.js';
 import { app } from '../core/state.js';
 
 // ── inline templates: avatar / badge / profile link ─────────────────────────
 
-// ponytail: @error swaps the broken <img> for a letter <div> imperatively, which
-// detaches the node from lit's part. The avatar-bearing lists (ledger rows,
-// followers cards) are keyed with repeat() by user id, so each user's avatar node
-// stays stable and a swapped node is never recycled onto a different user.
-const onAvatarErr = (letter) => (event) =>
-  event.target.replaceWith(Object.assign(document.createElement('div'), { className: 'av', textContent: letter }));
+// Fresh pic URLs fetched by the shell's "reload photos" button, keyed by username.
+// ponytail: in-memory only — IG CDN URLs expire within days, so persisting them
+// just stores garbage (followers.js drops picUrl from its snapshots for the same
+// reason, and ledger's stored ones rot). Cache wins over the stored picUrl.
+export const picCache = new Map();
 
+// An avatar needs a refetch when it has no <img> at all (no URL known) or its
+// <img> finished loading with no pixels (expired / 403 URL). Still-loading and
+// not-yet-lazy-loaded images report complete=false and are left alone.
+export const needsPic = (el) => {
+  const img = el.firstElementChild;
+  return !img || (img.complete && !img.naturalWidth);
+};
+
+// ponytail: the letter sits *behind* the <img>. A broken or expired URL paints
+// nothing (alt="" suppresses the broken-image icon), so the letter shows through
+// — no @error handler, no imperative node swapping, and a re-render with a fresh
+// URL just works.
 export const avatar = (user) => {
   const letter = (user.username || '?').charAt(0).toUpperCase();
-  return user.picUrl
-    ? html`<img class="av" loading="lazy" src=${user.picUrl} alt="" @error=${onAvatarErr(letter)}>`
-    : html`<div class="av">${letter}</div>`;
+  const url = picCache.get(user.username) || user.picUrl;
+  return html`<div class="av" data-u=${user.username || ''}>${letter}${url ? html`<img class="pic" loading="lazy" src=${url} alt="">` : nothing}</div>`;
 };
 
 export const badge = (label, cls = '') => html`<span class="badge ${cls}">${label}</span>`;
@@ -82,7 +92,7 @@ export const scanOverlay = (label) => {
     '<div class="radar"><div class="lot"></div><div class="ring"></div><div class="ring"></div><div class="ring"></div><div class="sweep"></div></div>' +
     '<div class="pct" data-pct>0%</div><div class="bar"><i data-prog></i></div>' +
     `<div class="st" data-st>${esc(label || 'Starting…')}</div>` +
-    '<button class="ghost" data-cancel style="margin-top:20px">Cancel</button>';
+    '<div style="display:flex;gap:10px;margin-top:20px"><button class="ghost" data-stop>Stop &amp; keep</button><button class="ghost" data-cancel>Cancel</button></div>';
   app.root.appendChild(overlay);
   tryLottie($('.lot', overlay), $('.radar', overlay));
   return overlay;

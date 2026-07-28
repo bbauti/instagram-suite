@@ -2,8 +2,8 @@
 
 Read this first. It is the orientation for working in this repo as if you built it.
 
-**Instagram Suite** is a single paste-into-the-browser-console SPA bundling three Instagram
-tools (Ledger, Followers, Pending) over one shared core. No backend, no runtime build: you paste
+**Instagram Suite** is a single paste-into-the-browser-console SPA bundling four Instagram
+tools (Ledger, Followers, Posts, Pending) over one shared core. No backend, no runtime build: you paste
 `dist/instagram-suite.js` into Chrome DevTools on `instagram.com` (logged in) and a full-screen
 overlay opens. All data lives in `localStorage`; nothing is uploaded.
 
@@ -27,17 +27,19 @@ in the browser console after pasting, run `globalThis.__igsSelfTest()` (source: 
 ## Module map (`src/`)
 
 ```
-core/constants.js  HOST, IG_APP_ID, PAGE_SIZE, ROW_CAP, HASH (GraphQL query hashes), EDGE, RATE_LIMIT_RE
-core/utils.js      $, $$, getCookie, esc, fmt, fmtDelta, sleep, randInt, uid, fmtAgo, fmtDate, fmtCountdown, byId
+core/constants.js  HOST, IG_APP_ID, PAGE_SIZE, ROW_CAP, POST_PAGE, POST_CAP_DEFAULT, HASH (GraphQL query hashes), EDGE, RATE_LIMIT_RE
+core/utils.js      $, $$, getCookie, esc, fmt, fmtDelta, sleep, randInt, uid, fmtAgo, fmtDate, fmtCountdown, byId, detectUsername
 core/store.js      store {get,setRaw,save,remove} — localStorage with quota-safe compaction
 core/state.js      app = { root, view, active } — shared mutable app/DOM state holder
-core/api.js        RateLimit + ApiError classes; api client; scanList() paginator
+core/api.js        RateLimit + ApiError classes; api client; scanList() + scanPosts() paginators
+core/gender.js     guessGender() — local name-dictionary + suffix heuristic ('f'|'m'|'')
 core/queue.js      global paced action queue; SPEEDS, KIND_VERB, MAX_RETRIES=4
 ui/css.js          CSS string (one Müller-Brockmann design system)
 ui/components.js   avatar/badge/profileLink (lit templates), toast, scanOverlay, chartSVG
 ui/shell.js        module registry + SPA shell: renderShell, mountModule, teardown, renderQueuePanel, setModules
 tools/ledger.js    export const ledger
 tools/followers.js export const followers
+tools/posts.js     export const posts (+ nullsLast sort helper)
 tools/pending.js   export const pending
 tools/pending-import.js  pure ZIP reader + export parsers (classify/parseText/ingestZip/buildData), used by pending.js
 selftest.js        selfTest() — exposed as globalThis.__igsSelfTest
@@ -48,15 +50,16 @@ main.js            entry: teardown, inject CSS, boot tools, render shell, expose
 
 Each tool is an object: `{ id, label, requiresLogin?, boot(), mount(el), unmount(), onQueueChange() }`.
 
-- `requiresLogin` (optional) — `true` if the tool needs the live IG API (Ledger, Followers).
+- `requiresLogin` (optional) — `true` if the tool needs the live IG API (Ledger, Followers, Posts).
   Off instagram (`!api.loggedIn`) the shell disables its nav button and won't mount it; `main.js`
   opens the first usable tool (Pending off-host). Pending omits it.
 - `boot()` — register queue handlers and load persisted state (called once at startup).
 - `mount(el)` — render the tool's UI into the given container (sets `container`, calls `update()`).
 - `unmount()` — tear down (the shell calls this on the outgoing tool before swapping).
-- `onQueueChange()` — call `update()` to re-render when queue state changes.
+- `onQueueChange()` — call `update()` to re-render when queue state changes. Read-only tools
+  that never enqueue anything (Posts) omit it.
 
-`src/main.js` holds the list `const modules = [ledger, followers, pending]`, calls
+`src/main.js` holds the list `const modules = [ledger, followers, posts, pending]`, calls
 `setModules(modules)`, then `modules.forEach(m => m.boot?.())`. The shell's `mountModule(id)`
 sets `app.active`, calls the old tool's `unmount()` and the new tool's `mount(app.view)`.
 
@@ -68,7 +71,7 @@ sets `app.active`, calls the old tool's `unmount()` and the new tool's `mount(ap
 
 ## The queue (one global paced action queue)
 
-`src/core/queue.js` is ONE queue shared by all three tools: paces one action at a time on a
+`src/core/queue.js` is ONE queue shared by every tool that acts: paces one action at a time on a
 `SPEEDS` pace, single cooldown between actions, exponential backoff retries (`MAX_RETRIES=4`),
 rate-limit detection -> 10-minute auto-pause/auto-resume across ALL tools, and persistence to
 `localStorage` key `igs-queue` (running -> pending on reload). SPEEDS: safe 45–90s (default),
@@ -88,7 +91,7 @@ queue.enqueue([{ kind: 'mykind', userId, username }]);
 ```
 
 Existing kinds: `unfollow` (ledger), `fm-follow`/`fm-unfollow` (followers), `verify`/`cancel`
-(pending). Add a label to `KIND_VERB` in `queue.js` if the UI should name your action.
+(pending). Posts is read-only and registers none. Add a label to `KIND_VERB` in `queue.js` if the UI should name your action.
 
 ## Shared state
 
@@ -99,7 +102,7 @@ do not reintroduce one by importing the shell from a tool for state.
 
 ## Console handle
 
-`globalThis.IGS = { version, mount(id), close(), queue }` where `mount('ledger'|'followers'|'pending')`.
+`globalThis.IGS = { version, mount(id), close(), queue }` where `mount('ledger'|'followers'|'posts'|'pending')`.
 
 ## Coding conventions
 
@@ -124,5 +127,5 @@ endpoints; personal use on your own account.
 
 - `docs/ARCHITECTURE.md` — shared core, state holder, shell, queue engine, rendering model.
 - `docs/DEVELOPMENT.md` — setup, build/watch, the GOLDEN RULE, self-test.
-- `docs/TOOLS.md` — Ledger / Followers / Pending behaviour and storage keys.
-- `docs/API.md` — `core/api.js` client, GraphQL hashes/fallbacks, `scanList()`, rate limits.
+- `docs/TOOLS.md` — Ledger / Followers / Posts / Pending behaviour and storage keys.
+- `docs/API.md` — `core/api.js` client, GraphQL hashes/fallbacks, `scanList()`/`scanPosts()`, rate limits.

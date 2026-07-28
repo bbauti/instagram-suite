@@ -32,7 +32,8 @@ export const ledger = (() => {
   const usersIn = (list, byIdMap) => (list || []).filter((u) => byIdMap[u.id]);
 
   const computeDiff = (prev, curr) => {
-    if (!prev) return null;
+    // Partial (stopped mid-way) snapshots never diff — missing users would read as fake losses.
+    if (!prev || prev.partial || curr?.partial) return null;
     const currFollowersById = byId(curr.followers);
     const currFollowingById = byId(curr.following);
     return {
@@ -72,7 +73,9 @@ export const ledger = (() => {
   };
 
   const commitScan = (curr) => {
-    const prev = store.get(KEYS.current, null);
+    // Diff against the last FULL snapshot; a partial current never becomes `previous`.
+    const stored = store.get(KEYS.current, null);
+    const prev = stored?.partial ? store.get(KEYS.previous, null) : stored;
     const diff = computeDiff(prev, curr);
     if (diff) {
       let events = store.get(KEYS.events, []);
@@ -89,10 +92,12 @@ export const ledger = (() => {
       store.save(KEYS.events, events);
     }
 
-    let timeline = store.get(KEYS.timeline, []);
-    timeline.push({ ts: curr.ts, f: curr.counts.followers, g: curr.counts.following });
-    if (timeline.length > TIMELINE_LIMIT) timeline = timeline.slice(-TIMELINE_LIMIT);
-    store.save(KEYS.timeline, timeline);
+    if (!curr.partial) {
+      let timeline = store.get(KEYS.timeline, []);
+      timeline.push({ ts: curr.ts, f: curr.counts.followers, g: curr.counts.following });
+      if (timeline.length > TIMELINE_LIMIT) timeline = timeline.slice(-TIMELINE_LIMIT);
+      store.save(KEYS.timeline, timeline);
+    }
 
     if (prev) store.save(KEYS.previous, prev);
     const storedOk = store.save(KEYS.current, curr);
@@ -123,6 +128,7 @@ export const ledger = (() => {
     const badges = [
       u.isVerified ? badge('✓ verified', 'v') : nothing,
       u.isPrivate ? badge('private') : nothing,
+      opts.youFollow ? badge('you follow', 'blue') : nothing,
       opts.badge ? badge(opts.badge, opts.badgeClass || '') : nothing,
     ];
 
@@ -155,8 +161,8 @@ export const ledger = (() => {
       return html`<div class="empty">${opts.empty || `Nothing here${hint}.`}</div>`;
     }
     const shown = filtered.slice(0, ROW_CAP);
-    // keyed so a broken-image avatar node (swapped imperatively in @error) is
-    // never recycled onto a different user when the list filters/reorders.
+    // keyed by user id so rows keep their identity (and their avatar's load
+    // state) when the list filters/reorders.
     const rows = repeat(shown, (u) => u.id ?? u.username, (u) => rowTpl(u, typeof opts.row === 'function' ? opts.row(u) : opts.row));
     return html`<div class="rows">${rows}</div>${filtered.length > shown.length ? html`<div class="more">Showing first ${fmt(shown.length)} of ${fmt(filtered.length)} — search to narrow.</div>` : nothing}`;
   };
@@ -185,13 +191,15 @@ export const ledger = (() => {
     const events = model.events;
     const diff = model.diff || { gained: [], lost: [], startedFollowing: [], stoppedFollowing: [] };
     const unfollowRowOpts = { selectable: true, unfollowable: true, queueAware: true };
+    const followingById = byId(analysis.following);
+    const youFollow = (u) => !!followingById[u.id];
     return {
-      gained: { label: 'New followers', count: diff.gained.length, render: () => listTpl(diff.gained, { empty: 'No new followers since the previous scan.', row: { badge: 'new' } }) },
-      lost: { label: 'Removed follow', count: diff.lost.length, render: () => listTpl(diff.lost, { empty: 'Nobody unfollowed you since the previous scan.', row: { badge: 'unfollowed you', badgeClass: 'red' } }) },
+      gained: { label: 'New followers', count: diff.gained.length, render: () => listTpl(diff.gained, { empty: 'No new followers since the previous scan.', row: (u) => ({ badge: 'new', youFollow: youFollow(u) }) }) },
+      lost: { label: 'Removed follow', count: diff.lost.length, render: () => listTpl(diff.lost, { empty: 'Nobody unfollowed you since the previous scan.', row: (u) => ({ badge: 'unfollowed you', badgeClass: 'red', youFollow: youFollow(u) }) }) },
       nonfollowers: { label: "Don't follow back", count: analysis.nonFollowers.length, render: () => listTpl(analysis.nonFollowers, { empty: 'Everyone you follow follows you back.', row: unfollowRowOpts }) },
       fans: { label: 'Fans', count: analysis.fans.length, render: () => listTpl(analysis.fans, { empty: 'No one-way fans.', row: { badge: 'you don’t follow' } }) },
       mutuals: { label: 'Mutuals', count: analysis.mutuals.length, render: () => listTpl(analysis.mutuals, { empty: 'No mutuals yet.', row: unfollowRowOpts }) },
-      followers: { label: 'All followers', count: analysis.followers.length, render: () => listTpl(analysis.followers, { empty: 'No followers loaded — run a scan.' }) },
+      followers: { label: 'All followers', count: analysis.followers.length, render: () => listTpl(analysis.followers, { empty: 'No followers loaded — run a scan.', row: (u) => ({ youFollow: youFollow(u) }) }) },
       following: { label: 'Following', count: analysis.following.length, render: () => listTpl(analysis.following, { empty: 'Not following anyone, or no scan yet.', row: unfollowRowOpts }) },
       activity: { label: 'Activity', count: events.length, render: () => activityTpl(events) },
     };
@@ -250,7 +258,7 @@ export const ledger = (() => {
 
   // top toolbar: title, last-scan note, Scan now / Export actions.
   const headerToolbarTpl = (curr, hasData) => html`<div class="toolbar"><h3>Your followers &amp; following</h3>
-        <span class="note" style="margin:0">last scan: ${curr ? fmtAgo(curr.ts) : 'never'}</span><span class="sp" style="flex:1"></span>
+        <span class="note" style="margin:0">last scan: ${curr ? fmtAgo(curr.ts) : 'never'}${curr?.partial ? ' (partial)' : ''}</span><span class="sp" style="flex:1"></span>
         <button class="primary" @click=${runScan}>Scan now</button>
         <button class="ghost" ?disabled=${!hasData} @click=${exportJSON}>Export</button></div>`;
 
@@ -350,10 +358,15 @@ export const ledger = (() => {
     }
     state.scanning = true;
     let cancelled = false;
+    let stopped = false;
     const overlay = scanOverlay('Starting…');
     $('[data-cancel]', overlay).onclick = () => {
       cancelled = true;
       $('[data-st]', overlay).textContent = 'Cancelling…';
+    };
+    $('[data-stop]', overlay).onclick = () => {
+      stopped = true;
+      $('[data-st]', overlay).textContent = 'Stopping — keeping what’s loaded…';
     };
     const prevCount = store.get(KEYS.current, null)?.counts ?? {};
     const progress = (kind, loaded, total) => {
@@ -367,18 +380,24 @@ export const ledger = (() => {
       $('[data-st]', overlay).textContent = `Loading ${kind} — ${fmt(loaded)}${totalTxt}…`;
     };
     try {
-      const followers = await scanList('followers', progress, api.viewerId, () => cancelled);
-      const following = await scanList('following', progress, api.viewerId, () => cancelled);
+      const followers = await scanList('followers', progress, api.viewerId, () => cancelled, () => stopped);
+      // Stopped before the following pass: carry over the last known following
+      // list so mutuals / don't-follow-back / unfollow keep working.
+      const following = stopped
+        ? (store.get(KEYS.current, null)?.following || [])
+        : await scanList('following', progress, api.viewerId, () => cancelled, () => stopped);
       $('[data-prog]', overlay).style.width = '100%';
       $('[data-pct]', overlay).textContent = '100%';
-      const snapshot = { ts: Date.now(), counts: { followers: followers.length, following: following.length }, followers, following };
+      const snapshot = { ts: Date.now(), partial: stopped || undefined, counts: { followers: followers.length, following: following.length }, followers, following };
       const out = commitScan(snapshot);
       if (!out.storedOk) toast('Scan stored partially (storage full)');
       state.scanning = false;
       overlay.remove();
       rebuildModel();
       update();
-      toast(out.diff ? `${out.diff.gained.length} new · ${out.diff.lost.length} removed since last scan` : 'Baseline captured — scan again later');
+      toast(stopped
+        ? `Stopped — kept ${fmt(followers.length)} followers (partial; diffs resume on next full scan)`
+        : out.diff ? `${out.diff.gained.length} new · ${out.diff.lost.length} removed since last scan` : 'Baseline captured — scan again later');
     } catch (err) {
       state.scanning = false;
       overlay.remove();

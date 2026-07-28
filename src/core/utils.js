@@ -74,3 +74,11 @@ export const fmtCountdown = (ms) => {
 };
 
 export const byId = (list) => Object.fromEntries((list || []).map((u) => [u.id, u]));
+
+// The username of the profile page you're standing on, '' anywhere else.
+// Instagram's own routes live at the same depth, hence the reserved list.
+const RESERVED = new Set(['explore', 'reels', 'reel', 'direct', 'stories', 'p', 'tv', 'accounts', 'about', 'developer', 'legal', 'directory', 'lite', 'session', 'graphql', 'api', 'your_activity', 'emails', 'challenge', 'privacy', 'web']);
+export const detectUsername = () => {
+  const match = location.pathname.match(/^\/([A-Za-z0-9._]{1,30})\/?$/);
+  return match && !RESERVED.has(match[1].toLowerCase()) ? match[1] : '';
+};

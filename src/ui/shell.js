@@ -7,9 +7,10 @@
 import { html, render, nothing } from 'lit-html';
 import { app } from '../core/state.js';
 import { store } from '../core/store.js';
-import { $, $$, fmt, fmtCountdown } from '../core/utils.js';
-import { api } from '../core/api.js';
+import { $, $$, fmt, fmtCountdown, sleep, randInt } from '../core/utils.js';
+import { api, RateLimit } from '../core/api.js';
 import { queue, SPEEDS, KIND_VERB } from '../core/queue.js';
+import { picCache, needsPic, toast } from './components.js';
 
 // ── module registry ──────────────────────────────────────────────────────────
 let modules = [];
@@ -38,6 +39,64 @@ const navTpl = () => html`<div class="nav">${modules.map((mod) => {
 
 const whoTpl = () => html`<div class="who">viewer #${api.viewerId || '—'}${api.loggedIn ? nothing : html`<br>⚠ not on instagram.com`}</div>`;
 
+// ── reload profile photos (shell-level: works on whatever tool/tab is mounted) ─
+// IG CDN pic URLs expire within days, so stored avatars decay into letters (and
+// Ledger's Activity rows never had one). This refetches fresh URLs for the letter
+// avatars currently on screen into picCache, then redraws.
+// ponytail: sequential, human-paced, capped — one profile request per account, no
+// queue integration. Raise PIC_RELOAD_CAP if the rate limit turns out to tolerate it.
+const PIC_RELOAD_CAP = 60;
+let reloadingPics = false;
+
+const reloadPics = async () => {
+  if (reloadingPics) return;
+  if (!api.loggedIn) return toast('Open instagram.com logged in to reload photos');
+
+  const names = [...new Set($$('.av[data-u]', app.root).filter(needsPic).map((el) => el.dataset.u).filter(Boolean))];
+  if (!names.length) return toast('All profile photos on screen are already loaded');
+
+  const targets = names.slice(0, PIC_RELOAD_CAP);
+  const button = $('[data-pics]', app.root);
+  reloadingPics = true;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '⏳';
+  }
+
+  let loaded = 0;
+  let limited = false;
+  try {
+    for (const name of targets) {
+      try {
+        const profile = await api.getWebProfile(name);
+        if (profile.picUrl) {
+          picCache.set(name, profile.picUrl);
+          loaded += 1;
+          if (loaded % 10 === 0) app.active?.onQueueChange?.(); // show progress
+        }
+      } catch (err) {
+        if (err instanceof RateLimit) {
+          limited = true;
+          break;
+        }
+        // dead/renamed account: skip it, keep the letter
+      }
+      await sleep(randInt(250, 700));
+    }
+  } finally {
+    reloadingPics = false;
+    if (button) {
+      button.disabled = false;
+      button.textContent = '↻';
+    }
+    app.active?.onQueueChange?.(); // redraw with the fresh URLs
+  }
+
+  const left = names.length - loaded;
+  const leftTxt = left > 0 ? ` — ${fmt(left)} still missing, click again` : '';
+  toast(limited ? `Rate-limited — reloaded ${fmt(loaded)} photo(s), wait a bit` : `Reloaded ${fmt(loaded)} photo(s)${leftTxt}`);
+};
+
 export const renderShell = () => {
   render(html`
     <div class="wrap">
@@ -46,6 +105,7 @@ export const renderShell = () => {
         ${navTpl()}
         <div class="spacer"></div>
         ${whoTpl()}
+        <button class="iconbtn" data-pics title="Reload missing profile photos on this page" @click=${reloadPics}>↻</button>
         <button class="iconbtn" title="Close" @click=${() => teardown()}>✕</button>
       </div>
       ${store.usable ? nothing : html`<div class="warn">⚠ This page is sandboxed — browser storage is blocked, so nothing here is saved (imports, snapshots and the action queue vanish on reload). Open <b>instagram.com</b> directly for the full suite.</div>`}
